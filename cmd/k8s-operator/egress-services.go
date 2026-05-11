@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net/netip"
 	"reflect"
 	"slices"
 	"strings"
@@ -343,6 +344,38 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 			svc.Spec = clusterIPSvc.Spec
 		}); err != nil {
 			return nil, false, fmt.Errorf("error ensuring ClusterIP Service: %v", err)
+		}
+	}
+
+	crl := egressSvcEpsLabels(svc, clusterIPSvc)
+	// Only create EndpointSlices for IP families supported by the cluster.
+	for _, clusterIP := range clusterIPSvc.Spec.ClusterIPs {
+		ip, err := netip.ParseAddr(clusterIP)
+		if err != nil {
+			return nil, false, fmt.Errorf("error parsing ClusterIP %q: %w", clusterIP, err)
+		}
+		addrType := discoveryv1.AddressTypeIPv4
+		if ip.Is6() {
+			addrType = discoveryv1.AddressTypeIPv6
+		}
+		eps := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-%s", clusterIPSvc.Name, strings.ToLower(string(addrType))),
+				Namespace: esr.tsNamespace,
+				Labels:    crl,
+			},
+			AddressType: addrType,
+			Ports:       epsPortsFromSvc(clusterIPSvc),
+		}
+		if eps, err = createOrUpdate(ctx, esr.Client, esr.tsNamespace, eps, func(e *discoveryv1.EndpointSlice) {
+			e.Labels = eps.Labels
+			e.AddressType = eps.AddressType
+			e.Ports = eps.Ports
+			for _, p := range e.Endpoints {
+				p.Conditions.Ready = nil
+			}
+		}); err != nil {
+			return nil, false, fmt.Errorf("error ensuring %s EndpointSlice: %w", addrType, err)
 		}
 	}
 
