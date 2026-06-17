@@ -23,6 +23,8 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"tailscale.com/disco"
+	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/stun"
@@ -2111,4 +2113,34 @@ func (de *endpoint) setDERPHome(regionID uint16) {
 	if de.c.relayManager.hasPeerRelayServers.Load() {
 		de.c.relayManager.handleDERPHomeChange(de.publicKey, regionID)
 	}
+}
+
+// maybeSendTSMPDiscoAdvert conditionally emits an event indicating that we
+// should send our DiscoKey to the first node address of the [endpoint].
+//
+// The event is suppressed if less than [discoKeyAdvertisementInterval] has
+// passed since the last DiscoKey was sent, or netmap caching is disabled on
+// this node.
+func (de *endpoint) maybeSendTSMPDiscoAdvert(now mono.Time) {
+	if !buildfeatures.HasCacheNetMap ||
+		!envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") {
+		return
+	}
+
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
+	if !de.nodeAddr.IsValid() {
+		return
+	}
+
+	if !de.lastDiscoKeyAdvertisement.IsZero() && now.Sub(de.lastDiscoKeyAdvertisement) < discoKeyAdvertisementInterval {
+		return
+	}
+
+	de.lastDiscoKeyAdvertisement = now
+	de.c.tsmpDiscoKeyAvailablePub.Publish(NewDiscoKeyAvailable{
+		NodeFirstAddr: de.nodeAddr,
+		NodeID:        de.nodeID,
+	})
 }
