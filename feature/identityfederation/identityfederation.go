@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -19,6 +20,7 @@ import (
 	"tailscale.com/feature"
 	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
+	"tailscale.com/util/backoff"
 	"tailscale.com/wif"
 )
 
@@ -118,20 +120,34 @@ func parseOptionalAttributes(clientID string) (strippedID string, ephemeral bool
 
 // exchangeJWTForToken exchanges a JWT for a Tailscale access token.
 func exchangeJWTForToken(ctx context.Context, baseURL, clientID, idToken string) (string, error) {
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-	ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+	var token *oauth2.Token
+	var err error
+	bo := backoff.NewBackoff("exchange-jwt", log.Printf, time.Second*30)
+	retries := 5
 
-	token, err := (&oauth2.Config{
-		Endpoint: oauth2.Endpoint{
-			TokenURL: fmt.Sprintf("%s/api/v2/oauth/token-exchange", baseURL),
-		},
-	}).Exchange(ctx, "", oauth2.SetAuthURLParam("client_id", clientID), oauth2.SetAuthURLParam("jwt", idToken))
-	if err != nil {
-		// Try to extract more detailed error message
-		if retrieveErr, ok := errors.AsType[*oauth2.RetrieveError](err); ok {
-			return "", fmt.Errorf("token exchange failed with status %d: %s", retrieveErr.Response.StatusCode, string(retrieveErr.Body))
+	for i := range retries {
+		httpClient := &http.Client{Timeout: 30 * time.Second}
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+
+		token, err = (&oauth2.Config{
+			Endpoint: oauth2.Endpoint{
+				TokenURL: fmt.Sprintf("%s/api/v2/oauth/token-exchange", baseURL),
+			},
+		}).Exchange(ctx, "", oauth2.SetAuthURLParam("client_id", clientID), oauth2.SetAuthURLParam("jwt", idToken))
+		if err != nil {
+			// Try to extract more detailed error message
+			if retrieveErr, ok := errors.AsType[*oauth2.RetrieveError](err); ok {
+				return "", fmt.Errorf("token exchange failed with status %d: %s", retrieveErr.Response.StatusCode, string(retrieveErr.Body))
+			}
+
+			// Retry as this might be a transient error
+			if errors.Is(err, context.DeadlineExceeded) && i < retries {
+				bo.BackOff(context.Background(), err)
+				continue
+			}
+
+			return "", fmt.Errorf("unexpected token exchange request error: %w", err)
 		}
-		return "", fmt.Errorf("unexpected token exchange request error: %w", err)
 	}
 
 	return token.AccessToken, nil
