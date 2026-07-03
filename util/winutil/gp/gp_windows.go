@@ -8,9 +8,13 @@ package gp
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 
 	"golang.org/x/sys/windows"
+	"tailscale.com/types/logger"
+	"tailscale.com/util/winutil/gp/regext"
 )
 
 // Scope is a user or machine policy scope.
@@ -76,4 +80,116 @@ func toRefreshPolicyFlags(force bool) uint32 {
 		return _RP_FORCE
 	}
 	return 0
+}
+
+func IsDomainPolicyAppliedToRegistry() (bool, error) {
+	itr, err := AppliedGPOsForLocalMachine(&regext.REGISTRY_EXTENSION_GUID)
+	if err != nil {
+		return false, err
+	}
+
+	for gpo, err := range itr {
+		if err != nil {
+			return false, err
+		}
+
+		if !gpo.IsDisabled() && !gpo.IsLocal() {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func openMachineRegistryPolicyArchive() (*os.File, error) {
+	programData, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, windows.KF_FLAG_DEFAULT)
+	if err != nil {
+		return nil, err
+	}
+
+	// https://web.archive.org/web/20260120022445/https://sdmsoftware.com/security-related/understanding-the-registry-policy-archive-file/
+	return os.Open(filepath.Join(programData, "ntuser.pol"))
+}
+
+func IsPolicyAppliedToMachineRegistryKey(subKeyMatcher func(string) bool) (bool, error) {
+	if subKeyMatcher == nil {
+		return false, os.ErrInvalid
+	}
+
+	lock := NewMachinePolicyLock()
+	if lock.Lock() == nil {
+		defer lock.Unlock()
+	}
+
+	haveReg, err := IsDomainPolicyAppliedToRegistry()
+	if err != nil || !haveReg {
+		return haveReg, err
+	}
+
+	archive, err := openMachineRegistryPolicyArchive()
+	if err != nil {
+		return false, err
+	}
+
+	rr, err := regext.NewReaderTakeOwnership(archive)
+	if err != nil {
+		return false, err
+	}
+	defer rr.Close()
+
+	for rc, err := range rr.Entries() {
+		if err != nil {
+			return false, err
+		}
+		if subKeyMatcher(rc.SubKey) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func DumpAppliedRegistryGPOs(logf logger.Logf) {
+	if logf == nil {
+		return
+	}
+
+	lock := NewMachinePolicyLock()
+	if lock.Lock() == nil {
+		defer lock.Unlock()
+	}
+
+	itr, err := AppliedGPOsForLocalMachine(&regext.REGISTRY_EXTENSION_GUID)
+	if err != nil {
+		logf("AppliedGPOsForLocalMachine failed: %v", err)
+	}
+
+	for v, err := range itr {
+		if err != nil {
+			logf("Conversion failed: %v", err)
+			return
+		}
+		logf("Entry:\n%#v", v)
+
+		rr, err := regext.NewReaderFromPolicyPath(v.FileSysPath)
+		if err != nil {
+			logf("NewReaderFromPolicyPath error: %v", err)
+			return
+		}
+
+		err = func() error {
+			defer rr.Close()
+			for cmd, err := range rr.Entries() {
+				if err != nil {
+					logf("Error during iteration: %v", err)
+					return err
+				}
+				logf("SubKey: %s", cmd.SubKey)
+			}
+			return nil
+		}()
+		if err != nil {
+			return
+		}
+	}
 }

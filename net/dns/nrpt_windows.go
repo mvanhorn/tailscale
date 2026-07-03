@@ -13,13 +13,12 @@ import (
 	"golang.org/x/sys/windows/registry"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/set"
 	"tailscale.com/util/winutil"
 	"tailscale.com/util/winutil/gp"
 )
 
 const (
-	dnsBaseGP     = `SOFTWARE\Policies\Microsoft\Windows NT\DNSClient`
+	dnsBaseGP     = `SOFTWARE\Policies\Microsoft\Windows NT\DNSClient\`
 	nrptBaseLocal = `SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig`
 	nrptBaseGP    = `SOFTWARE\Policies\Microsoft\Windows NT\DNSClient\DnsPolicyConfig`
 
@@ -108,37 +107,13 @@ func (db *nrptRuleDatabase) detectWriteAsGP() {
 		}
 	}()
 
-	// Get a list of all the NRPT rules under the GP subkey.
-	nrptKey, err := registry.OpenKey(registry.LOCAL_MACHINE, nrptBaseGP, registry.READ)
-	if err != nil {
-		if err != registry.ErrNotExist {
-			db.logf("Failed to open key %q with error: %v\n", nrptBaseGP, err)
-		}
-		// If this subkey does not exist then we definitely don't need to use the GP key.
-		return
-	}
-	defer nrptKey.Close()
-
-	gpSubkeyNames, err := nrptKey.ReadSubKeyNames(0)
-	if err != nil {
-		db.logf("Failed to list subkeys under %q with error: %v\n", nrptBaseGP, err)
-		return
+	// TODO(aaron): just lowercase the constant
+	compareAgainst := strings.ToLower(dnsBaseGP)
+	matcher := func(testSubKey string) bool {
+		return strings.HasPrefix(strings.ToLower(testSubKey), compareAgainst)
 	}
 
-	// Add *all* rules from the GP subkey into a set.
-	gpSubkeyMap := make(set.Set[string], len(gpSubkeyNames))
-	for _, gpSubkey := range gpSubkeyNames {
-		gpSubkeyMap.Add(strings.ToUpper(gpSubkey))
-	}
-
-	// Remove *our* rules from the set.
-	for _, ourRuleID := range db.ruleIDs {
-		gpSubkeyMap.Delete(strings.ToUpper(ourRuleID))
-	}
-
-	// Any leftover rules do not belong to us. When group policy is being used
-	// by something else, we must also use the GP path.
-	writeAsGP = len(gpSubkeyMap) > 0
+	writeAsGP, err = gp.IsPolicyAppliedToMachineRegistryKey(matcher)
 }
 
 // DelAllRuleKeys removes any and all NRPT rules that are owned by Tailscale.

@@ -43,6 +43,8 @@ var (
 
 	procImpersonateLoggedOnUser    = modadvapi32.NewProc("ImpersonateLoggedOnUser")
 	procEnterCriticalPolicySection = moduserenv.NewProc("EnterCriticalPolicySection")
+	procFreeGPOListW               = moduserenv.NewProc("FreeGPOListW")
+	procGetAppliedGPOListW         = moduserenv.NewProc("GetAppliedGPOListW")
 	procLeaveCriticalPolicySection = moduserenv.NewProc("LeaveCriticalPolicySection")
 	procRefreshPolicyEx            = moduserenv.NewProc("RefreshPolicyEx")
 	procRegisterGPNotification     = moduserenv.NewProc("RegisterGPNotification")
@@ -66,6 +68,22 @@ func enterCriticalPolicySection(machine bool) (handle policyLockHandle, err erro
 	handle = policyLockHandle(r0)
 	if int32(handle) == 0 {
 		err = errnoErr(e1)
+	}
+	return
+}
+
+func freeGPOList(gpoList *_GROUP_POLICY_OBJECT) (err error) {
+	r1, _, e1 := syscall.SyscallN(procFreeGPOListW.Addr(), uintptr(unsafe.Pointer(gpoList)))
+	if int32(r1) == 0 {
+		err = errnoErr(e1)
+	}
+	return
+}
+
+func getAppliedGPOList(flags uint32, machineName *uint16, userSid *windows.SID, extensionID *windows.GUID, gpoList **_GROUP_POLICY_OBJECT) (ret error) {
+	r0, _, _ := syscall.SyscallN(procGetAppliedGPOListW.Addr(), uintptr(flags), uintptr(unsafe.Pointer(machineName)), uintptr(unsafe.Pointer(userSid)), uintptr(unsafe.Pointer(extensionID)), uintptr(unsafe.Pointer(gpoList)))
+	if r0 != 0 {
+		ret = syscall.Errno(r0)
 	}
 	return
 }
