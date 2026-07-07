@@ -52,7 +52,6 @@ import (
 	"tailscale.com/util/execqueue"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
-	"tailscale.com/util/singleflight"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
@@ -620,17 +619,6 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		}
 		e.magicConn.HandleDiscoKeyAdvertisement(peer.Node, pkt)
 	})
-	var tsmpRequestGroup singleflight.Group[netip.Addr, struct{}]
-	eventbus.SubscribeFunc(ec, func(req magicsock.NewDiscoKeyAvailable) {
-		if !req.NodeFirstAddr.IsValid() {
-			return
-		}
-		go tsmpRequestGroup.Do(req.NodeFirstAddr, func() (struct{}, error) {
-			e.sendTSMPDiscoAdvertisement(req.NodeFirstAddr)
-			e.logf("wgengine: sending TSMP disco key advertisement to %v", req.NodeFirstAddr)
-			return struct{}{}, nil
-		})
-	})
 	e.eventClient = ec
 	e.logf("Engine created.")
 	return e, nil
@@ -755,6 +743,15 @@ func (e *userspaceEngine) SetPeerSessionStateFunc(fn func(key.NodePublic, PeerWi
 		if fn != nil {
 			fn(key.NodePublicFromRaw32(mem.B(pk[:])), peerWireGuardStateFromDevice(state))
 		}
+	})
+}
+
+func (e *userspaceEngine) SetPeerPriorityMessageOnEstablishmentFunc(fn func(key.NodePublic) (msg []byte)) {
+	e.wgdev.SetPriorityMessageOnEstablishmentFunc(func(pk device.NoisePublicKey) (msg []byte) {
+		if fn != nil {
+			return fn(key.NodePublicFromRaw32(mem.B(pk[:])))
+		}
+		return nil
 	})
 }
 
@@ -1403,7 +1400,6 @@ func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size in
 		e.magicConn.Ping(peer, res, size, cb)
 	case "TSMP":
 		e.sendTSMPPing(ip, peer, res, cb)
-		e.sendTSMPDiscoAdvertisement(ip)
 	case "ICMP":
 		e.sendICMPEchoRequest(ip, peer, res, cb)
 	}
@@ -1522,29 +1518,6 @@ func (e *userspaceEngine) sendTSMPPing(ip netip.Addr, peer tailcfg.NodeView, res
 
 	tsmpPing := packet.Generate(iph, tsmpPayload[:])
 	e.tundev.InjectOutbound(tsmpPing)
-}
-
-func (e *userspaceEngine) sendTSMPDiscoAdvertisement(ip netip.Addr) {
-	srcIP, err := e.mySelfIPMatchingFamily(ip)
-	if err != nil {
-		e.logf("getting matching node: %s", err)
-		return
-	}
-	tdka := packet.TSMPDiscoKeyAdvertisement{
-		Src: srcIP,
-		Dst: ip,
-		Key: e.magicConn.DiscoPublicKey(),
-	}
-	payload, err := tdka.Marshal()
-	if err != nil {
-		e.logf("error generating TSMP Advertisement: %s", err)
-		metricTSMPDiscoKeyAdvertisementError.Add(1)
-	} else if err := e.tundev.InjectOutbound(payload); err != nil {
-		e.logf("error sending TSMP Advertisement: %s", err)
-		metricTSMPDiscoKeyAdvertisementError.Add(1)
-	} else {
-		metricTSMPDiscoKeyAdvertisementSent.Add(1)
-	}
 }
 
 func (e *userspaceEngine) setTSMPPongCallback(data [8]byte, cb func(packet.TSMPPongReply)) {

@@ -636,6 +636,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	e.SetPeerByIPPacketFunc(b.lookupPeerByIP)
 	e.SetPeerForIPFunc(b.peerForIP)
 	e.SetPeerSessionStateFunc(b.onPeerWireGuardState)
+	e.SetPeerPriorityMessageOnEstablishmentFunc(b.MagicConn().PriorityMessageForPeer)
 	e.SetNetLogNodeSource(netLogNodeSource{b})
 	e.SetWGPeerLookup(b.lookupPeerWireGuardString)
 	b.dialer.SetResolveMagicDNS(b.resolveMagicDNS)

@@ -1989,6 +1989,8 @@ func (e *mockEngine) PeerKeyForIP(netip.Addr) (_ key.NodePublic, _ netip.Prefix,
 }
 func (e *mockEngine) SetPeerSessionStateFunc(func(key.NodePublic, wgengine.PeerWireGuardState)) {
 }
+func (e *mockEngine) SetPeerPriorityMessageOnEstablishmentFunc(fn func(key.NodePublic) (msg []byte)) {
+}
 func (e *mockEngine) SetNetLogNodeSource(netlog.NodeSource)                            {}
 func (e *mockEngine) SetWGPeerLookup(func(wgString string) (tsString string, ok bool)) {}
 func (e *mockEngine) ProbeLocks()                                                      {}
