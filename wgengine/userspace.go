@@ -34,6 +34,7 @@ import (
 	"tailscale.com/net/ipset"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/routemanager"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
@@ -51,7 +52,6 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/execqueue"
 	"tailscale.com/util/mak"
-	"tailscale.com/util/set"
 	"tailscale.com/util/singleflight"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
@@ -90,9 +90,6 @@ type userspaceEngine struct {
 	birdClient     BIRDClient          // or nil
 	controlKnobs   *controlknobs.Knobs // or nil
 
-	testMaybeReconfigHook func()                        // for tests; if non-nil, fires if maybeReconfigWireguardLocked called
-	testDiscoChangedHook  func(map[key.NodePublic]bool) // for tests; if non-nil, fires after assembling discoChanged map
-
 	// isLocalAddr reports the whether an IP is assigned to the local
 	// tunnel interface. It's used to reflect local packets
 	// incorrectly sent to us.
@@ -104,25 +101,18 @@ type userspaceEngine struct {
 
 	wgLock sync.Mutex // serializes all wgdev operations; see lock order comment below
 
-	// peerByIPRoute is a longest-prefix-match table built from
-	// lastCfgFull.Peers AllowedIPs. It's the slow path for
-	// SetPeerByIPPacketFunc, used when LocalBackend's exact-IP fast path
-	// (nodeByAddr) misses — i.e. for subnet routes and exit-node default
-	// routes. Built from lastCfgFull (the wireguard-filtered peer list)
-	// rather than the netmap so that exit-node selection is honored: the
-	// netmap has 0.0.0.0/0 in AllowedIPs for every exit-capable peer, but
-	// lastCfgFull only has it for the currently-selected exit node.
-	//
-	// Replaced (not mutated) by maybeReconfigWireguardLocked. Read by
-	// the per-packet wgdev callback without locking.
-	peerByIPRoute atomic.Pointer[bart.Table[key.NodePublic]]
-
-	// peerForIP, if non-nil, is the callback installed via
-	// [userspaceEngine.SetPeerForIPFunc]. PeerForIP delegates to it
+	// peerForIPFn, if non-nil, is the callback installed via
+	// [userspaceEngine.SetPeerForIPFunc]. peerForIP delegates to it
 	// for the cold-path control lookups (Ping, TSMP, pendopen, etc).
-	peerForIP atomic.Pointer[func(netip.Addr) (_ PeerForIP, ok bool)]
+	peerForIPFn atomic.Pointer[func(netip.Addr) (_ PeerForIP, ok bool)]
 
-	lastCfgFull        wgcfg.Config
+	// peerConfigFn, if non-nil, is the live per-peer allowed-IPs
+	// source installed via [userspaceEngine.SetPeerConfigFunc]. When
+	// set, wgdev's PeerLookupFunc queries it directly, so reconfigs
+	// no longer install per-config lookup closures.
+	peerConfigFn atomic.Pointer[func(key.NodePublic) (allowedIPs []netip.Prefix, ok bool)]
+
+	lastCfg            wgcfg.Config
 	lastRouter         *router.Config
 	lastDNSConfig      dns.ConfigView // or invalid if none
 	lastIsSubnetRouter bool           // was the node a primary subnet router in the last run.
@@ -168,10 +158,6 @@ type userspaceEngine struct {
 	// lookup was installed, in which case peer references are not
 	// rewritten.
 	wgPeerLookup syncs.AtomicValue[func(wgString string) (tsString string, ok bool)]
-
-	// tsmpLearnedDisco tracks per node key if a peer disco key was learned via TSMP.
-	// wgLock must be held when using this map.
-	tsmpLearnedDisco map[key.NodePublic]key.DiscoPublic
 
 	// Lock ordering: magicsock.Conn.mu, wgLock, then mu.
 }
@@ -519,16 +505,6 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	e.logf("Creating WireGuard device...")
 	e.wgdev = wgcfg.NewDevice(e.tundev, e.magicConn.Bind(), e.wgLogger.DeviceLogger)
 	closePool.addFunc(e.wgdev.Close)
-
-	// Install a default outbound-packet peer lookup callback. It uses only
-	// the engine's BART table, which is rebuilt from the wireguard-filtered
-	// peer list on every Reconfig. Consumers (e.g. LocalBackend) may later
-	// call SetPeerByIPPacketFunc to additionally install a fast path for
-	// exact node-address matches; the BART remains the slow-path fallback.
-	// Without this default, callers that don't run a LocalBackend would
-	// have no way to route outbound packets to peers, since peers are
-	// created lazily from inbound packets only via SetPeerLookupFunc.
-	e.SetPeerByIPPacketFunc(nil)
 	closePool.addFunc(func() {
 		if err := e.magicConn.Close(); err != nil {
 			e.logf("error closing magicconn: %v", err)
@@ -623,7 +599,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		pkt := packet.TSMPDiscoKeyAdvertisement{
 			Key: update.Key,
 		}
-		peer, ok := e.PeerForIP(update.Src)
+		peer, ok := e.peerForIP(update.Src)
 		if !ok {
 			e.logf("wgengine: no peer found for %v", update.Src)
 			return
@@ -699,62 +675,66 @@ func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper)
 	return filter.Accept
 }
 
-// maybeReconfigWireguardLocked reconfigures wireguard-go with the current
-// full config, installing a PeerLookupFunc for on-demand peer creation.
-//
-// e.wgLock must be held.
-func (e *userspaceEngine) maybeReconfigWireguardLocked() error {
-	if hook := e.testMaybeReconfigHook; hook != nil {
-		hook()
-		return nil
-	}
+// SetPeerConfigFunc implements [Engine.SetPeerConfigFunc]. It stores
+// fn and installs a single wgdev PeerLookupFunc wrapping it, so
+// lazily-created peers always get current allowed IPs and the lookup
+// func never needs to be reinstalled as the peer set changes.
+func (e *userspaceEngine) SetPeerConfigFunc(fn func(key.NodePublic) (allowedIPs []netip.Prefix, ok bool)) {
+	e.peerConfigFn.Store(&fn)
+	e.wgdev.SetPeerLookupFunc(wgcfg.NewPeerLookupFunc(e.wgdev.Bind(), e.logf, func(pubk device.NoisePublicKey) ([]netip.Prefix, bool) {
+		return fn(key.NodePublicFromRaw32(mem.B(pubk[:])))
+	}))
+}
 
-	full := e.lastCfgFull
-	// The wireguard-go peer set may have changed; drop the cached
-	// peer-string rewrites so the next log line re-resolves them
-	// against the current lookup.
+// SyncDevicePeer implements [Engine.SyncDevicePeer].
+func (e *userspaceEngine) SyncDevicePeer(k key.NodePublic) {
+	fn := e.peerConfigFn.Load()
+	if fn == nil {
+		return
+	}
+	e.wgLock.Lock()
+	defer e.wgLock.Unlock()
+	// The peer set may be about to change; drop the wgLogger's cached
+	// peer-string rewrites so the next log line re-resolves them.
 	e.wgLogger.Invalidate()
-
-	// Rebuild the prefix-match peer routing table from the current
-	// (wireguard-filtered) peer list and publish it atomically.
-	rt := &bart.Table[key.NodePublic]{}
-	for _, p := range full.Peers {
-		for _, pfx := range p.AllowedIPs {
-			rt.Insert(pfx, p.PublicKey)
-		}
+	allowedIPs, ok := (*fn)(k)
+	if !ok {
+		e.wgdev.RemovePeer(k.Raw32())
+		return
 	}
-	e.peerByIPRoute.Store(rt)
-
-	e.logf("wgengine: Reconfig: configuring userspace WireGuard config (with %d peers)", len(full.Peers))
-	if err := wgcfg.ReconfigDevice(e.wgdev, &full, e.logf); err != nil {
-		e.logf("wgdev.Reconfig: %v", err)
-		return err
+	if peer, ok := e.wgdev.LookupActivePeer(k.Raw32()); ok {
+		peer.SetAllowedIPs(allowedIPs)
 	}
-	return nil
+}
+
+// ResetDevicePeer implements [Engine.ResetDevicePeer].
+func (e *userspaceEngine) ResetDevicePeer(k key.NodePublic) {
+	e.wgLock.Lock()
+	defer e.wgLock.Unlock()
+	e.wgLogger.Invalidate()
+	e.wgdev.RemovePeer(k.Raw32())
 }
 
 // SetPeerByIPPacketFunc installs a callback used by wireguard-go to look up
 // which peer should handle an outbound packet by destination IP.
 //
-// fn is an optional fast path for exact node-address matches (e.g. dst is a
-// Tailscale IP). On miss (or if fn is nil), the engine's own BART table
-// ([userspaceEngine.peerByIPRoute], built from the wireguard-filtered peer
-// list) is consulted to handle subnet routes and exit-node default routes.
+// LocalBackend's implementation consults both the exact node-address fast
+// path and the RouteManager's outbound table (covering subnet routes and
+// exit-node default routes), and stays correct under incremental netmap
+// deltas.
 //
-// [NewUserspaceEngine] installs a BART-only default at engine creation time,
-// so callers that don't call SetPeerByIPPacketFunc (e.g. those not running
-// a LocalBackend) still get working outbound packet routing.
+// A nil fn uninstalls the callback, reverting the device to its standard
+// WireGuard AllowedIPs trie, which only contains peers that already exist
+// in the device. Callers without a LocalBackend that need outbound packets
+// to lazily create peers must install their own callback.
 func (e *userspaceEngine) SetPeerByIPPacketFunc(fn func(netip.Addr) (_ key.NodePublic, ok bool)) {
+	if fn == nil {
+		e.wgdev.SetPeerByIPPacketFunc(nil)
+		return
+	}
 	e.wgdev.SetPeerByIPPacketFunc(func(_, dst netip.Addr, _ []byte) (device.NoisePublicKey, bool) {
-		if fn != nil {
-			if pk, ok := fn(dst); ok {
-				return pk.Raw32(), true
-			}
-		}
-		if rt := e.peerByIPRoute.Load(); rt != nil {
-			if pk, ok := rt.Lookup(dst); ok {
-				return pk.Raw32(), true
-			}
+		if pk, ok := fn(dst); ok {
+			return pk.Raw32(), true
 		}
 		return device.NoisePublicKey{}, false
 	})
@@ -820,12 +800,6 @@ func (e *userspaceEngine) ResetAndStop() (*Status, error) {
 	return e.getStatus()
 }
 
-func (e *userspaceEngine) PatchDiscoKey(pub key.NodePublic, disco key.DiscoPublic) {
-	e.wgLock.Lock()
-	defer e.wgLock.Unlock()
-	mak.Set(&e.tsmpLearnedDisco, pub, disco)
-}
-
 func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config) error {
 	if routerCfg == nil {
 		panic("routerCfg must not be nil")
@@ -839,11 +813,6 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	e.wgLock.Lock()
 	defer e.wgLock.Unlock()
 	e.tundev.SetWGConfig(cfg)
-
-	peerSet := make(set.Set[key.NodePublic], len(cfg.Peers))
-	for _, p := range cfg.Peers {
-		peerSet.Add(p.PublicKey)
-	}
 
 	e.mu.Lock()
 	self := e.selfNode
@@ -865,7 +834,7 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	}
 	isSubnetRouterChanged := buildfeatures.HasAdvertiseRoutes && isSubnetRouter != e.lastIsSubnetRouter
 
-	engineChanged := !e.lastCfgFull.Equal(cfg)
+	engineChanged := !e.lastCfg.Equal(cfg)
 	routerChanged := checkchange.Update(&e.lastRouter, routerCfg)
 	dnsChanged := buildfeatures.HasDNS && !e.lastDNSConfig.Equal(dnsCfg.View())
 	if dnsChanged {
@@ -897,64 +866,7 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		e.isDNSIPOverTailscale.Store(ipset.NewContainsIPFunc(views.SliceOf(dnsIPsOverTailscale(dnsCfg, routerCfg))))
 	}
 
-	// See if any peers have changed disco keys, which means they've restarted.
-	// If so, remove the peer from wireguard-go to flush its session key,
-	// then let the PeerLookupFunc re-create it on demand.
-	discoChanged := make(map[key.NodePublic]bool)
-	if engineChanged {
-		prevEP := make(map[key.NodePublic]key.DiscoPublic)
-		for i := range e.lastCfgFull.Peers {
-			if p := &e.lastCfgFull.Peers[i]; !p.DiscoKey.IsZero() {
-				prevEP[p.PublicKey] = p.DiscoKey
-			}
-		}
-		for i := range cfg.Peers {
-			p := &cfg.Peers[i]
-			if p.DiscoKey.IsZero() {
-				continue
-			}
-
-			pub := p.PublicKey
-
-			if old, ok := prevEP[pub]; ok && old != p.DiscoKey {
-				// If the disco key was learned via TSMP, we do not need to reset the
-				// wireguard config as the new key was received over an existing wireguard
-				// connection.
-				if discoTSMP, okTSMP := e.tsmpLearnedDisco[p.PublicKey]; okTSMP {
-					// Key matches, remove entry from map.
-					delete(e.tsmpLearnedDisco, p.PublicKey)
-					if discoTSMP == p.DiscoKey {
-						e.logf("wgengine: Skipping reconfig (TSMP key): %s changed from %q to %q",
-							pub.ShortString(), old, p.DiscoKey)
-						// Skip session clear.
-						continue
-					}
-
-					// The new disco key does not match what we received via
-					// TSMP for this peer. This is unexpected, though possible
-					// if processing a change in a large netmap ends up taking
-					// longer than the 2 second timeout in
-					// [controlClient.mapRoutineState.UpdateNetmapDelta], or if
-					// the context is cancelled mid update. Log the event, and reset
-					// the connection as it is possibly a stale entry in the map
-					// instead of a TSMP disco key update that led us here.
-					e.logf("wgengine: [unexpected] Reconfig: using TSMP key for %s (control stale): tsmp=%q control=%q old=%q",
-						pub.ShortString(), discoTSMP, p.DiscoKey, old)
-					metricTSMPLearnedKeyMismatch.Add(1)
-				}
-
-				discoChanged[pub] = true
-				e.logf("wgengine: Reconfig: %s changed from %q to %q", pub.ShortString(), old, p.DiscoKey)
-			}
-		}
-	}
-
-	// For tests, what disco connections needs to be changed.
-	if e.testDiscoChangedHook != nil {
-		e.testDiscoChangedHook(discoChanged)
-	}
-
-	if !e.lastCfgFull.PrivateKey.Equal(cfg.PrivateKey) {
+	if !e.lastCfg.PrivateKey.Equal(cfg.PrivateKey) {
 		// Tell magicsock about the new (or initial) private key
 		// (which is needed by DERP) before wgdev gets it, as wgdev
 		// will start trying to handshake, which we want to be able to
@@ -968,30 +880,16 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		}
 	}
 
-	e.lastCfgFull = *cfg.Clone()
+	e.lastCfg = *cfg.Clone()
 
-	e.magicConn.UpdatePeers(peerSet)
 	e.magicConn.SetPreferredPort(listenPort)
 	e.magicConn.UpdatePMTUD()
 
-	if engineChanged {
-		if err := e.maybeReconfigWireguardLocked(); err != nil {
-			return err
-		}
-		// Now that we've reconfigured wireguard-go, remove any peers with
-		// changed disco keys to flush their session keys, and let them be
-		// re-created on demand by the PeerLookupFunc.
-		for pub := range discoChanged {
-			e.wgdev.RemovePeer(pub.Raw32())
-		}
-	}
-
-	// Cleanup map of tsmp marks for peers that no longer exists in config.
-	for nodeKey := range e.tsmpLearnedDisco {
-		if !peerSet.Contains(nodeKey) {
-			delete(e.tsmpLearnedDisco, nodeKey)
-		}
-	}
+	// Note: no wireguard-go device reconfig happens here. The device
+	// learns its peer set from the live config source installed via
+	// [Engine.SetPeerConfigFunc] (peers are lazily created and synced
+	// per peer by [Engine.SyncDevicePeer]), and its private key is set
+	// above when it changes.
 
 	if routerChanged {
 		e.logf("wgengine: Reconfig: configuring router")
@@ -1074,6 +972,10 @@ func (e *userspaceEngine) GetJailedFilter() *filter.Filter {
 
 func (e *userspaceEngine) SetJailedFilter(filt *filter.Filter) {
 	e.tundev.SetJailedFilter(filt)
+}
+
+func (e *userspaceEngine) SetPeerRoutes(native4, native6 netip.Addr, routes *bart.Table[*routemanager.PeerRoute]) {
+	e.tundev.SetPeerRoutes(native4, native6, routes)
 }
 
 func (e *userspaceEngine) SetStatusCallback(cb StatusCallback) {
@@ -1358,7 +1260,7 @@ func (e *userspaceEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
 
 func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb func(*ipnstate.PingResult)) {
 	res := &ipnstate.PingResult{IP: ip.String()}
-	pip, ok := e.PeerForIP(ip)
+	pip, ok := e.peerForIP(ip)
 	if !ok {
 		e.logf("ping(%v): no matching peer", ip)
 		res.Err = "no matching peer"
@@ -1555,38 +1457,24 @@ func (e *userspaceEngine) ProbeLocks() {
 	e.wgLock.Unlock()
 }
 
-// SetPeerForIPFunc installs the callback used by [userspaceEngine.PeerForIP].
+// SetPeerForIPFunc installs the callback used by [userspaceEngine.peerForIP].
 // See [Engine.SetPeerForIPFunc].
 func (e *userspaceEngine) SetPeerForIPFunc(fn func(netip.Addr) (PeerForIP, bool)) {
 	if fn == nil {
-		e.peerForIP.Store(nil)
+		e.peerForIPFn.Store(nil)
 		return
 	}
-	e.peerForIP.Store(&fn)
+	e.peerForIPFn.Store(&fn)
 }
 
-// PeerKeyForIP looks up ip in the engine's AllowedIPs table
-// ([userspaceEngine.peerByIPRoute]). See [Engine.PeerKeyForIP].
-func (e *userspaceEngine) PeerKeyForIP(ip netip.Addr) (pk key.NodePublic, route netip.Prefix, ok bool) {
-	if !ip.IsValid() {
-		return pk, route, false
-	}
-	rt := e.peerByIPRoute.Load()
-	if rt == nil {
-		return pk, route, false
-	}
-	route, pk, ok = rt.LookupPrefixLPM(netip.PrefixFrom(ip, ip.BitLen()))
-	return pk, route, ok
-}
-
-// PeerForIP returns the node responsible for handling the given IP.
-// It delegates to the callback installed via [SetPeerForIPFunc]; engines
-// without an installed callback return (zero, false).
-func (e *userspaceEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
+// peerForIP returns the node responsible for handling the given IP.
+// It delegates to the callback installed via [Engine.SetPeerForIPFunc];
+// engines without an installed callback return (zero, false).
+func (e *userspaceEngine) peerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 	if !ip.IsValid() {
 		return ret, false
 	}
-	if fn := e.peerForIP.Load(); fn != nil {
+	if fn := e.peerForIPFn.Load(); fn != nil {
 		return (*fn)(ip)
 	}
 	return ret, false
@@ -1676,8 +1564,6 @@ var (
 
 	metricTSMPDiscoKeyAdvertisementSent  = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_sent")
 	metricTSMPDiscoKeyAdvertisementError = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_error")
-
-	metricTSMPLearnedKeyMismatch = clientmetric.NewCounter("magicsock_tsmp_learned_key_mismatch")
 )
 
 func (e *userspaceEngine) InstallCaptureHook(cb packet.CaptureCallback) {

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"net/netip"
 	"slices"
 	"testing"
 	"time"
@@ -14,7 +15,9 @@ import (
 	"tailscale.com/net/routecheck/peernode"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
+	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
@@ -270,4 +273,274 @@ var _ RouteCheckReport = *new(routecheckReport)
 
 func (rp routecheckReport) IsReachable(_ tailcfg.NodeID) peernode.Reachability {
 	return peernode.Reachability(rp)
+}
+
+func TestNodeBackendRouteManager(t *testing.T) {
+	nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
+
+	mkPeer := func(id tailcfg.NodeID, stableID tailcfg.StableNodeID, addr4 string, extra ...string) tailcfg.NodeView {
+		n := &tailcfg.Node{
+			ID:       id,
+			StableID: stableID,
+			Key:      key.NewNode().Public(),
+			HomeDERP: 1, // required by the route manager's reachability filter
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix(addr4),
+			},
+		}
+		n.AllowedIPs = append(n.AllowedIPs, n.Addresses...)
+		for _, s := range extra {
+			n.AllowedIPs = append(n.AllowedIPs, netip.MustParsePrefix(s))
+		}
+		return n.View()
+	}
+	wantPeerFor := func(ip string, want tailcfg.NodeView) {
+		t.Helper()
+		got, ok := nb.routeMgr.Outbound().Lookup(netip.MustParseAddr(ip))
+		if !want.Valid() {
+			if ok {
+				t.Errorf("Outbound lookup %s = %v; want no match", ip, got)
+			}
+			return
+		}
+		if !ok || got.Key != want.Key() {
+			t.Errorf("Outbound lookup %s = %v, %v; want %v", ip, got, ok, want.Key())
+		}
+	}
+
+	p1 := mkPeer(1, "stable1", "100.64.0.1/32")
+	p2 := mkPeer(2, "stable2", "100.64.0.2/32", "0.0.0.0/0", "::/0")
+
+	// A full netmap populates the route manager.
+	nb.SetNetMap(&netmap.NetworkMap{Peers: []tailcfg.NodeView{p1, p2}})
+	wantPeerFor("100.64.0.1", p1)
+	wantPeerFor("100.64.0.2", p2)
+	wantPeerFor("8.8.8.8", tailcfg.NodeView{}) // exit node not selected
+
+	// Selecting peer 2 as the exit node resolves its stable ID and
+	// installs its /0 routes. The commit reports peer 2's allowed
+	// prefixes as changed.
+	if changed := nb.updateRouteManagerPrefs("stable2", false, false); len(changed) != 1 || changed[p2.Key()] == nil {
+		t.Errorf("updateRouteManagerPrefs(exit=stable2) changed = %v; want just %v", changed, p2.Key())
+	}
+	wantPeerFor("8.8.8.8", p2)
+	if changed := nb.updateRouteManagerPrefs("", false, false); len(changed) != 1 || changed[p2.Key()] == nil {
+		t.Errorf("updateRouteManagerPrefs(exit=none) changed = %v; want just %v", changed, p2.Key())
+	}
+	wantPeerFor("8.8.8.8", tailcfg.NodeView{})
+
+	// Incremental deltas: add peer 3, remove peer 1.
+	p3 := mkPeer(3, "stable3", "100.64.0.3/32")
+	handled, changed, _ := nb.UpdateNetmapDelta([]netmap.NodeMutation{
+		netmap.NodeMutationUpsert{Node: p3},
+		netmap.MakeNodeMutationRemove(1),
+	})
+	if !handled {
+		t.Fatal("UpdateNetmapDelta not handled")
+	}
+	if len(changed) != 2 || changed[p3.Key()] == nil {
+		t.Errorf("UpdateNetmapDelta changed = %v; want entries for %v and %v", changed, p3.Key(), p1.Key())
+	}
+	if v, ok := changed[p1.Key()]; !ok || v != nil {
+		t.Errorf("UpdateNetmapDelta changed[%v] = %v, %v; want nil, true for removed peer", p1.Key(), v, ok)
+	}
+	wantPeerFor("100.64.0.3", p3)
+	wantPeerFor("100.64.0.1", tailcfg.NodeView{})
+
+	// A full netmap that drops a peer removes it from the route manager.
+	nb.SetNetMap(&netmap.NetworkMap{Peers: []tailcfg.NodeView{p2}})
+	wantPeerFor("100.64.0.3", tailcfg.NodeView{})
+	wantPeerFor("100.64.0.2", p2)
+}
+
+func TestNodeBackendRouteManagerExtras(t *testing.T) {
+	nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
+
+	n := &tailcfg.Node{
+		ID:       1,
+		Key:      key.NewNode().Public(),
+		HomeDERP: 1,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("100.64.0.1/32"),
+		},
+	}
+	n.AllowedIPs = n.Addresses
+	p1 := n.View()
+	nb.SetNetMap(&netmap.NetworkMap{Peers: []tailcfg.NodeView{p1}})
+
+	transit := netip.MustParsePrefix("fe80::1234/128")
+	extrasFor := func(k key.NodePublic) views.Slice[netip.Prefix] {
+		if k == p1.Key() {
+			return views.SliceOf([]netip.Prefix{transit})
+		}
+		return views.Slice[netip.Prefix]{}
+	}
+
+	// Installing extras reports the peer's allowed prefixes as
+	// changed and adds the transit IP to the outbound table.
+	changed := nb.updateRouteManagerExtras(extrasFor)
+	if len(changed) != 1 || !slices.Contains(changed[p1.Key()], transit) {
+		t.Errorf("updateRouteManagerExtras changed = %v; want %v including %v", changed, p1.Key(), transit)
+	}
+	if pr, ok := nb.routeMgr.Outbound().Lookup(transit.Addr()); !ok || pr.Key != p1.Key() {
+		t.Errorf("Outbound lookup %v = %v, %v; want %v", transit.Addr(), pr, ok, p1.Key())
+	}
+	if _, ok := nb.routeMgr.OSRoutes().Get(transit); ok {
+		t.Errorf("OSRoutes contains %v; extras must not reach the OS route set", transit)
+	}
+
+	// An unchanged hook result is a no-op.
+	if changed := nb.updateRouteManagerExtras(extrasFor); changed != nil {
+		t.Errorf("unchanged extras reported changes: %v", changed)
+	}
+
+	// A hook that no longer returns extras removes them.
+	changed = nb.updateRouteManagerExtras(func(key.NodePublic) views.Slice[netip.Prefix] {
+		return views.Slice[netip.Prefix]{}
+	})
+	if len(changed) != 1 {
+		t.Errorf("clearing extras changed = %v; want just %v", changed, p1.Key())
+	}
+	if _, ok := nb.routeMgr.Outbound().Lookup(transit.Addr()); ok {
+		t.Errorf("Outbound still routes %v after extras cleared", transit.Addr())
+	}
+}
+
+// TestNodeBackendDiscoChanged exercises the full-netmap disco change
+// detection: a peer whose disco key changes has restarted and needs its
+// WireGuard session reset, unless the new key was already learned over
+// TSMP (that is, over a working WireGuard session with the peer).
+func TestNodeBackendDiscoChanged(t *testing.T) {
+	nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
+
+	nk := key.NewNode().Public()
+	mkNetMap := func(disco key.DiscoPublic) *netmap.NetworkMap {
+		n := &tailcfg.Node{
+			ID:       1,
+			Key:      nk,
+			DiscoKey: disco,
+			HomeDERP: 1,
+		}
+		return &netmap.NetworkMap{Peers: []tailcfg.NodeView{n.View()}}
+	}
+	newDisco := func() key.DiscoPublic { return key.NewDisco().Public() }
+
+	// A brand-new peer is not a disco change.
+	d1 := newDisco()
+	if got, _ := nb.SetNetMap(mkNetMap(d1)); len(got) != 0 {
+		t.Errorf("SetNetMap(new peer) discoChanged = %v; want none", got)
+	}
+
+	// A changed disco key requires a session reset.
+	d2 := newDisco()
+	if got, _ := nb.SetNetMap(mkNetMap(d2)); !slices.Contains(got, nk) {
+		t.Errorf("SetNetMap(changed disco) discoChanged = %v; want %v", got, nk)
+	}
+
+	// An unchanged disco key does not.
+	if got, _ := nb.SetNetMap(mkNetMap(d2)); len(got) != 0 {
+		t.Errorf("SetNetMap(same disco) discoChanged = %v; want none", got)
+	}
+
+	// A change already learned via TSMP is suppressed...
+	d3 := newDisco()
+	nb.recordTSMPLearnedDisco(nk, d3)
+	if got, _ := nb.SetNetMap(mkNetMap(d3)); len(got) != 0 {
+		t.Errorf("SetNetMap(TSMP-learned disco) discoChanged = %v; want none", got)
+	}
+
+	// ...but the TSMP entry is consumed, so the next change resets again.
+	d4 := newDisco()
+	if got, _ := nb.SetNetMap(mkNetMap(d4)); !slices.Contains(got, nk) {
+		t.Errorf("SetNetMap(after TSMP entry consumed) discoChanged = %v; want %v", got, nk)
+	}
+
+	// A TSMP-learned key that doesn't match the netmap's new key still
+	// resets the session and bumps the mismatch metric.
+	before := metricTSMPLearnedKeyMismatch.Value()
+	nb.recordTSMPLearnedDisco(nk, newDisco())
+	d5 := newDisco()
+	if got, _ := nb.SetNetMap(mkNetMap(d5)); !slices.Contains(got, nk) {
+		t.Errorf("SetNetMap(TSMP mismatch) discoChanged = %v; want %v", got, nk)
+	}
+	if delta := metricTSMPLearnedKeyMismatch.Value() - before; delta != 1 {
+		t.Errorf("metricTSMPLearnedKeyMismatch delta = %d; want 1", delta)
+	}
+
+	// Removing the peer garbage-collects its TSMP entry: after the peer
+	// comes back, a change to the once-recorded key is a normal reset.
+	d6 := newDisco()
+	nb.recordTSMPLearnedDisco(nk, d6)
+	nb.SetNetMap(&netmap.NetworkMap{})
+	nb.SetNetMap(mkNetMap(d5))
+	if got, _ := nb.SetNetMap(mkNetMap(d6)); !slices.Contains(got, nk) {
+		t.Errorf("SetNetMap(after TSMP entry GC) discoChanged = %v; want %v", got, nk)
+	}
+
+	// Transitions to or from a zero disco key never reset.
+	if got, _ := nb.SetNetMap(mkNetMap(key.DiscoPublic{})); len(got) != 0 {
+		t.Errorf("SetNetMap(to zero disco) discoChanged = %v; want none", got)
+	}
+	if got, _ := nb.SetNetMap(mkNetMap(d1)); len(got) != 0 {
+		t.Errorf("SetNetMap(from zero disco) discoChanged = %v; want none", got)
+	}
+}
+
+// TestNodeBackendDiscoChangedDelta is like TestNodeBackendDiscoChanged
+// but for the incremental path: disco changes arriving as
+// [netmap.NodeMutationUpsert] deltas.
+func TestNodeBackendDiscoChangedDelta(t *testing.T) {
+	nb := newNodeBackend(t.Context(), tstest.WhileTestRunningLogger(t), eventbus.New())
+
+	mkNode := func(k key.NodePublic, disco key.DiscoPublic) tailcfg.NodeView {
+		return (&tailcfg.Node{ID: 1, Key: k, DiscoKey: disco, HomeDERP: 1}).View()
+	}
+	newDisco := func() key.DiscoPublic { return key.NewDisco().Public() }
+	apply := func(muts ...netmap.NodeMutation) []key.NodePublic {
+		t.Helper()
+		handled, _, discoChanged := nb.UpdateNetmapDelta(muts)
+		if !handled {
+			t.Fatal("UpdateNetmapDelta not handled")
+		}
+		return discoChanged
+	}
+
+	nk := key.NewNode().Public()
+	d1 := newDisco()
+	nb.SetNetMap(&netmap.NetworkMap{Peers: []tailcfg.NodeView{mkNode(nk, d1)}})
+
+	// An upserted peer with a changed disco key needs a session reset.
+	d2 := newDisco()
+	if got := apply(netmap.NodeMutationUpsert{Node: mkNode(nk, d2)}); !slices.Contains(got, nk) {
+		t.Errorf("upsert(changed disco) discoChanged = %v; want %v", got, nk)
+	}
+
+	// An unchanged disco key does not.
+	if got := apply(netmap.NodeMutationUpsert{Node: mkNode(nk, d2)}); len(got) != 0 {
+		t.Errorf("upsert(same disco) discoChanged = %v; want none", got)
+	}
+
+	// A change already learned via TSMP is suppressed.
+	d3 := newDisco()
+	nb.recordTSMPLearnedDisco(nk, d3)
+	if got := apply(netmap.NodeMutationUpsert{Node: mkNode(nk, d3)}); len(got) != 0 {
+		t.Errorf("upsert(TSMP-learned disco) discoChanged = %v; want none", got)
+	}
+
+	// A node key rotation replaces the WireGuard peer outright, so no
+	// disco-based reset is reported.
+	nk2 := key.NewNode().Public()
+	if got := apply(netmap.NodeMutationUpsert{Node: mkNode(nk2, newDisco())}); len(got) != 0 {
+		t.Errorf("upsert(rotated node key) discoChanged = %v; want none", got)
+	}
+
+	// Removing the peer garbage-collects its TSMP entry: after the peer
+	// comes back, a change to the once-recorded key is a normal reset.
+	d4 := newDisco()
+	nb.recordTSMPLearnedDisco(nk2, d4)
+	apply(netmap.MakeNodeMutationRemove(1))
+	apply(netmap.NodeMutationUpsert{Node: mkNode(nk2, newDisco())})
+	if got := apply(netmap.NodeMutationUpsert{Node: mkNode(nk2, d4)}); !slices.Contains(got, nk2) {
+		t.Errorf("upsert(after TSMP entry GC) discoChanged = %v; want %v", got, nk2)
+	}
 }

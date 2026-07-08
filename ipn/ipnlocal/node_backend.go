@@ -19,6 +19,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/routecheck/peernode"
+	"tailscale.com/net/routemanager"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -158,6 +159,21 @@ type nodeBackend struct {
 	// [nodeBackend.AwaitNodeKeyForTest]. It is populated lazily and remains
 	// nil in production, where no test installs a waiter.
 	keyWaitersForTest map[key.NodePublic]chan struct{}
+
+	// tsmpLearnedDisco records, per node key, a peer disco key that was
+	// learned via TSMP (that is, over an existing WireGuard session with
+	// that peer). When a netmap update later reports the same disco key
+	// change, the peer's WireGuard session does not need to be reset,
+	// because the change demonstrably arrived over a working session.
+	// See [nodeBackend.discoChangedLocked].
+	tsmpLearnedDisco map[key.NodePublic]key.DiscoPublic
+
+	// routeMgr tracks this node's view of which IPs route to which
+	// peers and publishes lock-free snapshots for the data plane and
+	// the OS router. It is initialized once and immutable, but its
+	// Begin/Commit mutations must be serialized, which we do by only
+	// mutating it with mu held.
+	routeMgr *routemanager.RouteManager
 }
 
 func newNodeBackend(ctx context.Context, logf logger.Logf, bus *eventbus.Bus) *nodeBackend {
@@ -168,6 +184,7 @@ func newNodeBackend(ctx context.Context, logf logger.Logf, bus *eventbus.Bus) *n
 		ctxCancel:   ctxCancel,
 		eventClient: bus.Client("ipnlocal.nodeBackend"),
 		readyCh:     make(chan struct{}),
+		routeMgr:    routemanager.New(logf),
 	}
 	// Default filter blocks everything and logs nothing.
 	noneFilter := filter.NewAllowNone(logger.Discard, &netipx.IPSet{})
@@ -250,6 +267,22 @@ func (nb *nodeBackend) NodeByKey(k key.NodePublic) (_ tailcfg.NodeID, ok bool) {
 	defer nb.mu.Unlock()
 	nid, ok := nb.nodeByKey[k]
 	return nid, ok
+}
+
+// PeerAllowedIPs returns the prefixes from which the peer with the
+// given public key is currently allowed to originate traffic, or
+// ok=false if the key is unknown or the peer currently contributes no
+// prefixes.
+func (nb *nodeBackend) PeerAllowedIPs(k key.NodePublic) ([]netip.Prefix, bool) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	id, ok := nb.nodeByKey[k]
+	if !ok {
+		return nil, false
+	}
+	// Holding nb.mu satisfies routeMgr's serialization requirement:
+	// all routeMgr mutations also run under nb.mu.
+	return nb.routeMgr.PeerAllowedIPs(id)
 }
 
 // NodeByWireGuardString returns the node ID of the peer whose
@@ -549,14 +582,14 @@ func (nb *nodeBackend) netMapWithPeers() *netmap.NetworkMap {
 	return nm
 }
 
-func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) {
+func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) (discoChanged []key.NodePublic, routeChanged map[key.NodePublic][]netip.Prefix) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	nb.netMap = nm
 	nb.updateNodeByAddrLocked()
 	nb.updateNodeByKeyLocked()
 	nb.updateNodeByNameLocked()
-	nb.updatePeersLocked()
+	discoChanged, routeChanged = nb.updatePeersLocked()
 	nb.signalKeyWaitersForTestLocked()
 	if nm != nil {
 		nb.userProfiles = maps.Clone(nm.UserProfiles)
@@ -569,6 +602,7 @@ func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) {
 		nb.packetFilter = nil
 		nb.derpMapViewPub.Publish(tailcfg.DERPMapView{})
 	}
+	return discoChanged, routeChanged
 }
 
 // AwaitNodeKeyForTest returns a channel that is closed once a peer with the
@@ -735,18 +769,161 @@ func (nb *nodeBackend) ExtraDNSByName(hostname string) (_ netip.Addr, ok bool) {
 	return ip, ok
 }
 
-func (nb *nodeBackend) updatePeersLocked() {
+func (nb *nodeBackend) updatePeersLocked() (discoChanged []key.NodePublic, routeChanged map[key.NodePublic][]netip.Prefix) {
 	nm := nb.netMap
-	if nm == nil {
-		nb.peers = nil
-		return
+	oldIDs := slices.Collect(maps.Keys(nb.peers))
+
+	// Snapshot the previous disco keys (by node key) before the peers
+	// map is repopulated, to detect restarted peers below.
+	var prevDisco map[key.NodePublic]key.DiscoPublic
+	for _, p := range nb.peers {
+		if !p.DiscoKey().IsZero() {
+			mak.Set(&prevDisco, p.Key(), p.DiscoKey())
+		}
 	}
 
-	mapx.RepopulateNonzero(&nb.peers, func() {
-		for _, p := range nm.Peers {
-			nb.peers[p.ID()] = p
+	if nm == nil {
+		nb.peers = nil
+	} else {
+		mapx.RepopulateNonzero(&nb.peers, func() {
+			for _, p := range nm.Peers {
+				nb.peers[p.ID()] = p
+			}
+		})
+	}
+
+	for _, p := range nb.peers {
+		if prev, ok := prevDisco[p.Key()]; ok && nb.discoChangedLocked(p.Key(), prev, p.DiscoKey()) {
+			discoChanged = append(discoChanged, p.Key())
 		}
-	})
+	}
+	// Drop TSMP-learned disco keys for peers no longer in the netmap.
+	for k := range nb.tsmpLearnedDisco {
+		if _, ok := nb.nodeByKey[k]; !ok {
+			delete(nb.tsmpLearnedDisco, k)
+		}
+	}
+
+	// Resync the route manager to the new peer set. Upserts of
+	// unchanged peers are cheap no-ops; this is a full-netmap event,
+	// so O(n) work is expected here.
+	rt := nb.routeMgr.Begin()
+	for _, id := range oldIDs {
+		if _, ok := nb.peers[id]; !ok {
+			rt.RemovePeer(id)
+		}
+	}
+	for _, p := range nb.peers {
+		rt.UpsertPeer(p)
+	}
+	res := rt.Commit()
+	return discoChanged, res.AllowedIPs
+}
+
+// recordTSMPLearnedDisco notes that a peer's new disco key was learned via
+// TSMP, so the netmap update carrying the same change need not reset the
+// peer's WireGuard session. See the [nodeBackend.tsmpLearnedDisco] field doc.
+func (nb *nodeBackend) recordTSMPLearnedDisco(pub key.NodePublic, disco key.DiscoPublic) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	mak.Set(&nb.tsmpLearnedDisco, pub, disco)
+}
+
+// discoChangedLocked reports whether a peer's disco key change from prev to
+// cur should reset the peer's WireGuard session. A changed disco key means
+// the peer restarted, so any existing session key material is dead weight;
+// resetting lets the handshake start over immediately. The exception is a
+// key change already learned via TSMP: that arrived over a working WireGuard
+// session with the peer, so the session is demonstrably fine and is kept.
+//
+// It consumes any [nodeBackend.tsmpLearnedDisco] entry for pub.
+// nb.mu must be held.
+func (nb *nodeBackend) discoChangedLocked(pub key.NodePublic, prev, cur key.DiscoPublic) bool {
+	if prev.IsZero() || cur.IsZero() || prev == cur {
+		return false
+	}
+	if discoTSMP, ok := nb.tsmpLearnedDisco[pub]; ok {
+		delete(nb.tsmpLearnedDisco, pub)
+		if discoTSMP == cur {
+			nb.logf("nodeBackend: skipping WireGuard session reset (TSMP key): %s changed from %q to %q",
+				pub.ShortString(), prev, cur)
+			return false
+		}
+		// The new disco key does not match what we received via
+		// TSMP for this peer. This is unexpected, though possible
+		// if processing a change in a large netmap ends up taking
+		// longer than the 2 second timeout in
+		// [controlclient.mapRoutineState.UpdateNetmapDelta], or if
+		// the context is cancelled mid update. Log the event, and reset
+		// the session as it is possibly a stale entry in the map
+		// instead of a TSMP disco key update that led us here.
+		nb.logf("nodeBackend: [unexpected] using TSMP key for %s (control stale): tsmp=%q control=%q old=%q",
+			pub.ShortString(), discoTSMP, cur, prev)
+		metricTSMPLearnedKeyMismatch.Add(1)
+	}
+	nb.logf("nodeBackend: peer %s disco key changed from %q to %q", pub.ShortString(), prev, cur)
+	return true
+}
+
+// updateRouteManagerPrefs pushes the routing-relevant prefs and the
+// OneCGNAT decision into the route manager. The exit node arrives as
+// a stable ID from prefs and is resolved to the current numeric node
+// ID here; it resolves to zero (no exit node) if that peer is not in
+// the netmap yet, in which case a later netmap update re-runs this.
+//
+// It returns the peers whose allowed source prefixes changed as a
+// result (for example the old and new exit node when the selection
+// changes), as described by [routemanager.Result.AllowedIPs].
+func (nb *nodeBackend) updateRouteManagerPrefs(exitNodeID tailcfg.StableNodeID, routeAll, oneCGNAT bool) (changedAllowedIPs map[key.NodePublic][]netip.Prefix) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	var exitID tailcfg.NodeID
+	if !exitNodeID.IsZero() {
+		for id, p := range nb.peers {
+			if p.StableID() == exitNodeID {
+				exitID = id
+				break
+			}
+		}
+	}
+	rt := nb.routeMgr.Begin()
+	rt.SetPrefs(routemanager.Prefs{ExitNodeID: exitID, RouteAll: routeAll})
+	rt.SetTailnetConfig(routemanager.TailnetConfig{OneCGNAT: oneCGNAT})
+	res := rt.Commit()
+	return res.AllowedIPs
+}
+
+// updateRouteManagerExtras pushes each peer's extra WireGuard-only
+// allowed IPs into the route manager, obtained by calling fn (the
+// [ipnext.Hooks.ExtraWireGuardAllowedIPs] hook) with each peer's
+// public key.
+//
+// It returns the peers whose allowed source prefixes changed as a
+// result, as described by [routemanager.Result.AllowedIPs].
+func (nb *nodeBackend) updateRouteManagerExtras(fn func(key.NodePublic) views.Slice[netip.Prefix]) (changedAllowedIPs map[key.NodePublic][]netip.Prefix) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	var extras map[tailcfg.NodeID][]netip.Prefix
+	for id, p := range nb.peers {
+		if pfxs := fn(p.Key()); pfxs.Len() > 0 {
+			mak.Set(&extras, id, pfxs.AsSlice())
+		}
+	}
+	rt := nb.routeMgr.Begin()
+	rt.SetExtraAllowedIPs(extras)
+	res := rt.Commit()
+	return res.AllowedIPs
+}
+
+// osRoutes returns the sorted set of prefixes that the route manager
+// wants programmed into the OS routing table.
+func (nb *nodeBackend) osRoutes() []netip.Prefix {
+	var routes []netip.Prefix
+	for pfx := range nb.routeMgr.OSRoutes().All() {
+		routes = append(routes, pfx)
+	}
+	tsaddr.SortPrefixes(routes)
+	return routes
 }
 
 // setPacketFilter stores the live packet filter rules and parsed
@@ -778,11 +955,18 @@ func (nb *nodeBackend) mergeUserProfiles(profiles map[tailcfg.UserID]tailcfg.Use
 	}
 }
 
-func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bool) {
+// UpdateNetmapDelta applies the given netmap mutations to the live
+// peer state. It reports whether it handled all of them, and returns
+// the peers whose allowed source prefixes changed (as described by
+// [routemanager.Result.AllowedIPs]) so the caller can sync those
+// peers to the WireGuard device, plus the peers whose disco key
+// changed in a way that requires a WireGuard session reset (see
+// [nodeBackend.discoChangedLocked]).
+func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bool, changedAllowedIPs map[key.NodePublic][]netip.Prefix, discoChanged []key.NodePublic) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	if nb.netMap == nil {
-		return false
+		return false, nil, nil
 	}
 
 	// Locally cloned mutable nodes, to avoid calling AsStruct (clone)
@@ -790,10 +974,29 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	// call (e.g. its endpoints + online status both change)
 	var mutableNodes map[tailcfg.NodeID]*tailcfg.Node
 
+	// Mirror peer add/remove mutations into the route manager. Committing
+	// on all return paths (including the not-handled one) matches the
+	// peers map above, which is also mutated in place as the loop runs;
+	// the full-netmap fallback then resyncs both the same way.
+	rt := nb.routeMgr.Begin()
+	defer func() {
+		res := rt.Commit()
+		changedAllowedIPs = res.AllowedIPs
+	}()
+
 	for _, m := range muts {
 		switch m := m.(type) {
 		case netmap.NodeMutationUpsert:
 			nid := m.Node.ID()
+			if old, ok := nb.peers[nid]; ok {
+				if old.Key() == m.Node.Key() {
+					if nb.discoChangedLocked(m.Node.Key(), old.DiscoKey(), m.Node.DiscoKey()) {
+						discoChanged = append(discoChanged, m.Node.Key())
+					}
+				} else {
+					delete(nb.tsmpLearnedDisco, old.Key())
+				}
+			}
 			mak.Set(&nb.peers, nid, m.Node)
 			for _, ipp := range m.Node.Addresses().All() {
 				if ipp.IsSingleIP() {
@@ -803,6 +1006,7 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 			mak.Set(&nb.nodeByKey, m.Node.Key(), nid)
 			mak.Set(&nb.nodeByWGString, m.Node.Key().WireGuardGoString(), nid)
 			nb.addNodeNameLocked(m.Node.Name(), nid)
+			rt.UpsertPeer(m.Node)
 			continue
 		case netmap.NodeMutationRemove:
 			nid := m.NodeIDBeingMutated()
@@ -814,8 +1018,10 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 				}
 				delete(nb.nodeByKey, old.Key())
 				delete(nb.nodeByWGString, old.Key().WireGuardGoString())
+				delete(nb.tsmpLearnedDisco, old.Key())
 				nb.removeNodeNameLocked(old.Name())
 				delete(nb.peers, nid)
+				rt.RemovePeer(nid)
 			}
 			continue
 		}
@@ -826,7 +1032,7 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 			nv, ok := nb.peers[nid]
 			if !ok {
 				// TODO(bradfitz): unexpected metric?
-				return false
+				return false, nil, discoChanged
 			}
 			n = nv.AsStruct()
 			mak.Set(&mutableNodes, nv.ID(), n)
@@ -837,7 +1043,7 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 		nb.peers[nid] = n.View()
 	}
 	nb.signalKeyWaitersForTestLocked()
-	return true
+	return true, nil, discoChanged
 }
 
 // unlockedNodesPermitted reports whether any peer with theUnsignedPeerAPIOnly bool set true has any of its allowed IPs

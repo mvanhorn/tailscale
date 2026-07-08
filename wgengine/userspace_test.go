@@ -90,7 +90,7 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 
 	routerCfg := &router.Config{}
 
-	for _, nodeHex := range []string{
+	for i, nodeHex := range []string{
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 	} {
@@ -102,18 +102,9 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 				},
 			}),
 		}
-		nk, err := key.ParseNodePublicUntyped(mem.S(nodeHex))
-		if err != nil {
-			t.Fatal(err)
-		}
 		cfg := &wgcfg.Config{
-			Peers: []wgcfg.Peer{
-				{
-					PublicKey: nk,
-					AllowedIPs: []netip.Prefix{
-						netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
-					},
-				},
+			Addresses: []netip.Prefix{
+				netip.PrefixFrom(netaddr.IPv4(100, 100, 99, byte(1+i)), 32),
 			},
 		}
 
@@ -121,167 +112,6 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 		err = e.Reconfig(cfg, routerCfg, &dns.Config{})
 		if err != nil {
 			t.Fatal(err)
-		}
-	}
-}
-
-func TestUserspaceEngineTSMPLearned(t *testing.T) {
-	bus := eventbustest.NewBus(t)
-
-	ht := health.NewTracker(bus)
-	reg := new(usermetric.Registry)
-	e, err := NewFakeUserspaceEngine(t.Logf, 0, ht, reg, bus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(e.Close)
-	ue := e.(*userspaceEngine)
-
-	discoChangedChan := make(chan map[key.NodePublic]bool, 1)
-	ue.testDiscoChangedHook = func(m map[key.NodePublic]bool) {
-		discoChangedChan <- m
-	}
-
-	routerCfg := &router.Config{}
-
-	keyChanges := []struct {
-		tsmp  bool
-		inMap bool
-	}{
-		{tsmp: false, inMap: false},
-		{tsmp: true, inMap: false},
-		{tsmp: false, inMap: true},
-	}
-
-	nkHex := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	for _, change := range keyChanges {
-		oldDisco := key.NewDisco()
-		nm := &netmap.NetworkMap{
-			Peers: nodeViews([]*tailcfg.Node{
-				{
-					ID:       1,
-					Key:      nkFromHex(nkHex),
-					DiscoKey: oldDisco.Public(),
-				},
-			}),
-		}
-		nk, err := key.ParseNodePublicUntyped(mem.S(nkHex))
-		if err != nil {
-			t.Fatal(err)
-		}
-		e.SetSelfNode(nm.SelfNode)
-
-		newDisco := key.NewDisco()
-		cfg := &wgcfg.Config{
-			Peers: []wgcfg.Peer{
-				{
-					PublicKey: nk,
-					DiscoKey:  newDisco.Public(),
-				},
-			},
-		}
-
-		if change.tsmp {
-			ue.PatchDiscoKey(nk, newDisco.Public())
-		}
-		err = e.Reconfig(cfg, routerCfg, &dns.Config{})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		changeMap := <-discoChangedChan
-
-		if _, ok := changeMap[nk]; ok != change.inMap {
-			t.Fatalf("expect key %v in map %v to be %t, got %t", nk, changeMap,
-				change.inMap, ok)
-		}
-	}
-}
-
-func TestUserspaceEngineTSMPLearnedMismatch(t *testing.T) {
-	bus := eventbustest.NewBus(t)
-
-	ht := health.NewTracker(bus)
-	reg := new(usermetric.Registry)
-	e, err := NewFakeUserspaceEngine(t.Logf, 0, ht, reg, bus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(e.Close)
-	ue := e.(*userspaceEngine)
-
-	discoChangedChan := make(chan map[key.NodePublic]bool, 1)
-	ue.testDiscoChangedHook = func(m map[key.NodePublic]bool) {
-		discoChangedChan <- m
-	}
-
-	routerCfg := &router.Config{}
-	var metricValue int64 = 0
-
-	keyChanges := []struct {
-		tsmp     bool
-		inMap    bool
-		wrongKey bool
-	}{
-		{tsmp: false, inMap: false, wrongKey: false},
-		{tsmp: true, inMap: false, wrongKey: false},
-		{tsmp: true, inMap: true, wrongKey: true},
-		{tsmp: false, inMap: true, wrongKey: false},
-	}
-
-	nkHex := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	for _, change := range keyChanges {
-		oldDisco := key.NewDisco()
-		nm := &netmap.NetworkMap{
-			Peers: nodeViews([]*tailcfg.Node{
-				{
-					ID:       1,
-					Key:      nkFromHex(nkHex),
-					DiscoKey: oldDisco.Public(),
-				},
-			}),
-		}
-		nk, err := key.ParseNodePublicUntyped(mem.S(nkHex))
-		if err != nil {
-			t.Fatal(err)
-		}
-		e.SetSelfNode(nm.SelfNode)
-
-		newDisco := key.NewDisco()
-		cfg := &wgcfg.Config{
-			Peers: []wgcfg.Peer{
-				{
-					PublicKey: nk,
-					DiscoKey:  newDisco.Public(),
-				},
-			},
-		}
-
-		tsmpKey := newDisco.Public()
-		if change.tsmp {
-			if change.wrongKey {
-				tsmpKey = key.NewDisco().Public()
-			}
-			ue.PatchDiscoKey(nk, tsmpKey)
-		}
-		err = e.Reconfig(cfg, routerCfg, &dns.Config{})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		changeMap := <-discoChangedChan
-
-		if _, ok := changeMap[nk]; ok != change.inMap {
-			t.Fatalf("expect key %v in map %v to be %t, got %t", nk, changeMap,
-				change.inMap, ok)
-		}
-
-		metric := metricTSMPLearnedKeyMismatch.Value()
-		delta := metric - metricValue
-		metricValue = metric
-
-		if change.wrongKey && delta != 1 {
-			t.Fatalf("expected a delta of 1, got %d", delta)
 		}
 	}
 }
@@ -317,18 +147,9 @@ func TestUserspaceEnginePortReconfig(t *testing.T) {
 	t.Cleanup(ue.Close)
 
 	startingPort := ue.magicConn.LocalPort()
-	nodeKey, err := key.ParseNodePublicUntyped(mem.S("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	cfg := &wgcfg.Config{
-		Peers: []wgcfg.Peer{
-			{
-				PublicKey: nodeKey,
-				AllowedIPs: []netip.Prefix{
-					netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
-				},
-			},
+		Addresses: []netip.Prefix{
+			netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
 		},
 	}
 	routerCfg := &router.Config{}
@@ -399,18 +220,9 @@ func TestUserspaceEnginePeerMTUReconfig(t *testing.T) {
 	t.Logf("Info: OS default don't fragment bit(s) setting: %v", osDefaultDF)
 
 	// Build a set of configs to use as we change the peer MTU settings.
-	nodeKey, err := key.ParseNodePublicUntyped(mem.S("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	cfg := &wgcfg.Config{
-		Peers: []wgcfg.Peer{
-			{
-				PublicKey: nodeKey,
-				AllowedIPs: []netip.Prefix{
-					netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
-				},
-			},
+		Addresses: []netip.Prefix{
+			netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
 		},
 	}
 	routerCfg := &router.Config{}
@@ -476,14 +288,7 @@ func TestTSMPKeyAdvertisement(t *testing.T) {
 		}).View(),
 	}
 	cfg := &wgcfg.Config{
-		Peers: []wgcfg.Peer{
-			{
-				PublicKey: nodeKey,
-				AllowedIPs: []netip.Prefix{
-					netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
-				},
-			},
-		},
+		Addresses: nm.SelfNode.Addresses().AsSlice(),
 	}
 
 	ue.SetSelfNode(nm.SelfNode)
