@@ -59,11 +59,9 @@ var (
 	verboseTailscaled = flag.Bool("verbose-tailscaled", false, "verbose tailscaled logging")
 	verboseTailscale  = flag.Bool("verbose-tailscale", false, "verbose tailscale CLI logging")
 
-	// runWindowsServiceTests opts a Windows run into starting tailscaled as a
-	// real LocalSystem service (install-system-daemon + sc start, real wintun)
-	// instead of a userspace child process. Off by default so the normal test
-	// suite stays skipped on Windows.
-	runWindowsServiceTests = flag.Bool("run-windows-service-tests", false, "on Windows, run tailscaled as a real system service instead of skipping")
+	// runWindowsServiceTests opts Windows tests into starting tailscaled as a
+	// service instead of a userspace child process. Tests run serially in this mode.
+	runWindowsServiceTests = flag.Bool("run-windows-service-tests", false, "run tailscaled as a Windows service")
 )
 
 // MainError is an error that's set if an error conditions happens outside of a
@@ -503,7 +501,7 @@ func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type TestEnv struct {
 	t                      testing.TB
 	tunMode                bool
-	windowsService         bool // run tailscaled as a real Windows service
+	windowsService         bool // run tailscaled as a Windows service
 	cli                    string
 	daemon                 string
 	loopbackPort           *int
@@ -799,7 +797,7 @@ type Daemon struct {
 
 func (d *Daemon) MustCleanShutdown(t testing.TB) {
 	if d.svc != nil {
-		d.svc.serviceCleanShutdown(t)
+		d.svc.stopService()
 		return
 	}
 	d.Process.Signal(os.Interrupt)
@@ -831,6 +829,44 @@ func (n *TestNode) awaitTailscaledRunnable() error {
 		return fmt.Errorf("gave up trying to run tailscaled: %v", err)
 	}
 	return nil
+}
+
+// daemonEnv returns the environment tailscaled is started with, shared by the
+// userspace child-process path (StartDaemonAsIPNGOOS) and the Windows service
+// path (which writes it to tailscaled-env.txt, since a service doesn't inherit
+// the test process's environment). ipnGOOS is the OS tailscaled should believe
+// it's running as. It does not include TS_PARENT_DEATH_FD, which is specific to
+// the child-process path.
+func (n *TestNode) daemonEnv(ipnGOOS string) []string {
+	env := []string{
+		"TS_DEBUG_PERMIT_HTTP_C2N=1",
+		"TS_LOG_TARGET=" + n.env.LogCatcherServer.URL,
+		"HTTP_PROXY=" + n.env.TrafficTrapServer.URL,
+		"HTTPS_PROXY=" + n.env.TrafficTrapServer.URL,
+		"TS_DEBUG_FAKE_GOOS=" + ipnGOOS,
+		"TS_LOGS_DIR=" + n.dir,
+		"TS_NETCHECK_GENERATE_204_URL=" + n.env.ControlServer.URL + "/generate_204",
+		"TS_ASSUME_NETWORK_UP_FOR_TEST=1", // don't pause control client in airplane mode (no wifi, etc)
+		"TS_PANIC_IF_HIT_MAIN_CONTROL=1",
+		"TS_DISABLE_PORTMAPPER=1", // shouldn't be needed; test is all localhost
+		"TS_DEBUG_LOG_RATE=all",
+	}
+	if n.allowUpdates {
+		env = append(env, "TS_TEST_ALLOW_AUTO_UPDATE=1")
+	}
+	if n.env.loopbackPort != nil {
+		env = append(env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
+	}
+	if n.env.neverDirectUDP {
+		env = append(env, "TS_DEBUG_NEVER_DIRECT_UDP=1")
+	}
+	if n.env.relayServerUseLoopback {
+		env = append(env, "TS_DEBUG_RELAY_SERVER_ADDRS=::1,127.0.0.1")
+	}
+	if version.IsRace() {
+		env = append(env, "GORACE=halt_on_error=1")
+	}
+	return env
 }
 
 // StartDaemon starts the node's tailscaled, failing if it fails to start.
@@ -874,34 +910,7 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 	if n.encryptState {
 		cmd.Args = append(cmd.Args, "--encrypt-state")
 	}
-	cmd.Env = append(os.Environ(),
-		"TS_DEBUG_PERMIT_HTTP_C2N=1",
-		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
-		"HTTP_PROXY="+n.env.TrafficTrapServer.URL,
-		"HTTPS_PROXY="+n.env.TrafficTrapServer.URL,
-		"TS_DEBUG_FAKE_GOOS="+ipnGOOS,
-		"TS_LOGS_DIR="+t.TempDir(),
-		"TS_NETCHECK_GENERATE_204_URL="+n.env.ControlServer.URL+"/generate_204",
-		"TS_ASSUME_NETWORK_UP_FOR_TEST=1", // don't pause control client in airplane mode (no wifi, etc)
-		"TS_PANIC_IF_HIT_MAIN_CONTROL=1",
-		"TS_DISABLE_PORTMAPPER=1", // shouldn't be needed; test is all localhost
-		"TS_DEBUG_LOG_RATE=all",
-	)
-	if n.allowUpdates {
-		cmd.Env = append(cmd.Env, "TS_TEST_ALLOW_AUTO_UPDATE=1")
-	}
-	if n.env.loopbackPort != nil {
-		cmd.Env = append(cmd.Env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
-	}
-	if n.env.neverDirectUDP {
-		cmd.Env = append(cmd.Env, "TS_DEBUG_NEVER_DIRECT_UDP=1")
-	}
-	if n.env.relayServerUseLoopback {
-		cmd.Env = append(cmd.Env, "TS_DEBUG_RELAY_SERVER_ADDRS=::1,127.0.0.1")
-	}
-	if version.IsRace() {
-		cmd.Env = append(cmd.Env, "GORACE=halt_on_error=1")
-	}
+	cmd.Env = append(os.Environ(), n.daemonEnv(ipnGOOS)...)
 	n.tailscaledParser = &nodeOutputParser{n: n}
 	cmd.Stderr = n.tailscaledParser
 	if *verboseTailscaled {

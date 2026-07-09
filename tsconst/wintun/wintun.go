@@ -14,6 +14,15 @@ const (
 	URL = "https://www.wintun.net/builds/wintun-" + Version + ".zip"
 	// SHA256 is the hex-encoded sha256 of the zip at URL.
 	SHA256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
-	// ZipMember is the amd64 wintun.dll path inside the zip.
-	ZipMember = "wintun/bin/amd64/wintun.dll"
 )
+
+// DLLZipPath returns the path within the release zip of the wintun.dll for the
+// given GOARCH (e.g. "amd64", "arm64", "386"). The zip lays DLLs out by wintun's
+// own arch names, which match GOARCH except that 386 is named "x86".
+func DLLZipPath(goArch string) string {
+	arch := goArch
+	if goArch == "386" {
+		arch = "x86"
+	}
+	return "wintun/bin/" + arch + "/wintun.dll"
+}
