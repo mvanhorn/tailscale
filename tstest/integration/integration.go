@@ -40,6 +40,7 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
 	"tailscale.com/net/stun/stuntest"
+	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -57,6 +58,12 @@ import (
 var (
 	verboseTailscaled = flag.Bool("verbose-tailscaled", false, "verbose tailscaled logging")
 	verboseTailscale  = flag.Bool("verbose-tailscale", false, "verbose tailscale CLI logging")
+
+	// runWindowsServiceTests opts a Windows run into starting tailscaled as a
+	// real LocalSystem service (install-system-daemon + sc start, real wintun)
+	// instead of a userspace child process. Off by default so the normal test
+	// suite stays skipped on Windows.
+	runWindowsServiceTests = flag.Bool("run-windows-service-tests", false, "on Windows, run tailscaled as a real system service instead of skipping")
 )
 
 // MainError is an error that's set if an error conditions happens outside of a
@@ -98,7 +105,7 @@ type BinaryInfo struct {
 // was cleaned up.
 func (b BinaryInfo) CopyTo(dir string) (BinaryInfo, error) {
 	ret := b
-	ret.Path = filepath.Join(dir, path.Base(b.Path))
+	ret.Path = filepath.Join(dir, filepath.Base(b.Path))
 
 	switch runtime.GOOS {
 	case "linux":
@@ -496,6 +503,7 @@ func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type TestEnv struct {
 	t                      testing.TB
 	tunMode                bool
+	windowsService         bool // run tailscaled as a real Windows service
 	cli                    string
 	daemon                 string
 	loopbackPort           *int
@@ -537,8 +545,8 @@ func (f ConfigureControl) ModifyTestEnv(te *TestEnv) {
 // NewTestEnv starts a bunch of services and returns a new test environment.
 // NewTestEnv arranges for the environment's resources to be cleaned up on exit.
 func NewTestEnv(t testing.TB, opts ...TestEnvOpt) *TestEnv {
-	if runtime.GOOS == "windows" {
-		t.Skip("not tested/working on Windows yet")
+	if runtime.GOOS == "windows" && !*runWindowsServiceTests {
+		t.Skip("Windows only runs with --run-windows-service-tests (tailscaled as a service)")
 	}
 	derpMap := RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
 	logc := new(LogCatcher)
@@ -551,6 +559,7 @@ func NewTestEnv(t testing.TB, opts ...TestEnvOpt) *TestEnv {
 	binaries := GetBinaries(t)
 	e := &TestEnv{
 		t:                 t,
+		windowsService:    runtime.GOOS == "windows" && *runWindowsServiceTests,
 		cli:               binaries.Tailscale.Path,
 		daemon:            binaries.Tailscaled.Path,
 		LogCatcher:        logc,
@@ -608,11 +617,18 @@ func NewTestNode(t *testing.T, env *TestEnv) *TestNode {
 		sockFile = filepath.Join(os.TempDir(), rands.HexString(8)+".sock")
 		t.Cleanup(func() { os.Remove(sockFile) })
 	}
+	stateFile := filepath.Join(dir, "tailscaled.state") // matches what cmd/tailscaled uses
+	if env.windowsService {
+		// A LocalSystem service ignores --socket/--statedir and uses the
+		// default pipe and state path; point the harness at those.
+		sockFile = paths.DefaultTailscaledSocket()
+		stateFile = paths.DefaultTailscaledStateFile()
+	}
 	n := &TestNode{
 		env:       env,
 		dir:       dir,
 		sockFile:  sockFile,
-		stateFile: filepath.Join(dir, "tailscaled.state"), // matches what cmd/tailscaled uses
+		stateFile: stateFile,
 	}
 
 	// Look for a data race or panic.
@@ -775,9 +791,17 @@ func (op *nodeOutputParser) parseLinesLocked() {
 
 type Daemon struct {
 	Process *os.Process
+
+	// svc is set when the daemon is a Windows service (no owned Process);
+	// MustCleanShutdown then stops it via the SCM.
+	svc *TestNode
 }
 
 func (d *Daemon) MustCleanShutdown(t testing.TB) {
+	if d.svc != nil {
+		d.svc.serviceCleanShutdown(t)
+		return
+	}
 	d.Process.Signal(os.Interrupt)
 	ps, err := d.Process.Wait()
 	if err != nil {
@@ -820,6 +844,13 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 
 	if err := n.awaitTailscaledRunnable(); err != nil {
 		t.Fatalf("awaitTailscaledRunnable: %v", err)
+	}
+
+	if n.env.windowsService {
+		// Service mode has no stderr pipe; keep a parser so other helpers
+		// that reference it don't dereference nil.
+		n.tailscaledParser = &nodeOutputParser{n: n}
+		return n.startWindowsServiceDaemon()
 	}
 
 	cmd := exec.Command(n.env.daemon)
