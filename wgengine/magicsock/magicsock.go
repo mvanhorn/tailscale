@@ -4561,6 +4561,10 @@ func (c *Conn) PriorityMessageForPeer(nodeKey key.NodePublic) []byte {
 	}
 
 	ep.mu.Lock()
+	if !ep.bestAddr.isZero() {
+		ep.mu.Unlock()
+		return nil
+	}
 	dst := ep.nodeAddr
 	ep.mu.Unlock()
 
