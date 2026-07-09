@@ -85,23 +85,23 @@ func TestHostFileChanged(t *testing.T) {
 }
 
 func TestManagerWindowsLocal(t *testing.T) {
-	if !isWindows10OrBetter() || !winutil.IsCurrentProcessElevated() {
-		t.Skipf("test requires running as elevated user on Windows 10+")
+	if !winutil.IsCurrentProcessLocalSystem() {
+		t.Skipf("test requires running as LocalSystem on Windows 10+")
 	}
 
 	runTest(t, true)
 }
 
 func TestManagerWindowsGP(t *testing.T) {
-	if !isWindows10OrBetter() || !winutil.IsCurrentProcessElevated() {
-		t.Skipf("test requires running as elevated user on Windows 10+")
+	if !winutil.IsCurrentProcessLocalSystem() {
+		t.Skipf("test requires running as LocalSystem on Windows 10+")
 	}
 
 	checkGPNotificationsWork(t)
 
 	// Make sure group policy is refreshed before this test exits but after we've
 	// cleaned everything else up.
-	defer gp.RefreshMachinePolicy(true)
+	defer gp.NotifyMachinePolicyChange()
 
 	err := createFakeGPKey()
 	if err != nil {
@@ -113,8 +113,8 @@ func TestManagerWindowsGP(t *testing.T) {
 }
 
 func TestManagerWindowsGPCopy(t *testing.T) {
-	if !isWindows10OrBetter() || !winutil.IsCurrentProcessElevated() {
-		t.Skipf("test requires running as elevated user on Windows 10+")
+	if !winutil.IsCurrentProcessLocalSystem() {
+		t.Skipf("test requires running as LocalSystem on Windows 10+")
 	}
 
 	checkGPNotificationsWork(t)
@@ -179,10 +179,21 @@ func TestManagerWindowsGPCopy(t *testing.T) {
 		t.Fatalf("regWatcher.watch: %v\n", err)
 	}
 
-	err = gp.RefreshMachinePolicy(true)
+	ch := make(chan struct{})
+	nrptTestCallback = func() {
+		close(ch)
+	}
+	defer func() {
+		nrptTestCallback = nil
+	}()
+
+	err = gp.NotifyMachinePolicyChange()
 	if err != nil {
 		t.Fatalf("testDoRefresh: %v\n", err)
 	}
+
+	// Wait until the policy change notification has been received.
+	<-ch
 
 	err = regWatcher.wait()
 	if err != nil {
@@ -203,7 +214,7 @@ func TestManagerWindowsGPCopy(t *testing.T) {
 		t.Fatalf("regWatcher.watch: %v\n", err)
 	}
 
-	err = gp.RefreshMachinePolicy(true)
+	err = gp.NotifyMachinePolicyChange()
 	if err != nil {
 		t.Fatalf("testDoRefresh: %v\n", err)
 	}
@@ -236,7 +247,7 @@ func checkGPNotificationsWork(t *testing.T) {
 	}
 	defer trk.Close()
 
-	err = gp.RefreshMachinePolicy(true)
+	err = gp.NotifyMachinePolicyChange()
 	if err != nil {
 		t.Fatalf("RefreshPolicyEx error: %v\n", err)
 	}
@@ -263,12 +274,26 @@ func runTest(t *testing.T, isLocal bool) {
 	}
 	defer delIfKey()
 
+	ch := make(chan struct{})
+	nrptTestCallback = func() {
+		close(ch)
+	}
+	defer func() {
+		nrptTestCallback = nil
+	}()
+
 	cfg, err := NewOSConfigurator(logf, nil, nil, policyclient.NoPolicyClient{}, nil, fakeInterface.String())
 	if err != nil {
 		t.Fatalf("NewOSConfigurator: %v\n", err)
 	}
 	mgr := cfg.(*windowsManager)
 	defer mgr.Close()
+
+	if !isLocal {
+		// Wait until the policy change notification has occurred, thus adjusting
+		// mgr.nrptDB.writeAsGP as appropriate...
+		<-ch
+	}
 
 	usingGP := mgr.nrptDB.writeAsGP
 	if isLocal == usingGP {
@@ -345,10 +370,6 @@ func runTest(t *testing.T, isLocal bool) {
 
 	for _, n := range cases {
 		runCase(n)
-	}
-
-	if isLocal && trk.DidRefresh(false) {
-		t.Errorf("DidRefresh true, want false\n")
 	}
 
 	t.Logf("Test case: nil resolver\n")

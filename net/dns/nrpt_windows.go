@@ -50,6 +50,9 @@ const (
 	nrptRuleFlagsName = `ConfigOptions`
 )
 
+// nrptTestCallback is a hook used by tests to receive policy change notifications.
+var nrptTestCallback func()
+
 // nrptRuleDatabase encapsulates access to the Windows Name Resolution Policy
 // Table (NRPT).
 type nrptRuleDatabase struct {
@@ -65,8 +68,6 @@ type nrptRuleDatabase struct {
 func newNRPTRuleDatabase(logf logger.Logf) *nrptRuleDatabase {
 	ret := &nrptRuleDatabase{logf: logf}
 	ret.loadRuleSubkeyNames()
-	ret.detectWriteAsGP()
-	ret.watchForGPChanges()
 	// Best-effort: if our NRPT rule exists, try to delete it. Unlike
 	// per-interface configuration, NRPT rules survive the unclean
 	// termination of the Tailscale process, and depending on the
@@ -74,6 +75,8 @@ func newNRPTRuleDatabase(logf logger.Logf) *nrptRuleDatabase {
 	// boot up. The bootstrap resolver logic will save us, but it
 	// slows down start-up a bunch.
 	ret.DelAllRuleKeys()
+	ret.watchForGPChanges()
+	ret.sendInitialGPNotification()
 	return ret
 }
 
@@ -86,6 +89,8 @@ func (db *nrptRuleDatabase) loadRuleSubkeyNames() {
 // NRPT rules. If there are rules in the GP path that don't belong to us, then
 // we should use the GP path. When detectWriteAsGP determines that the desired
 // path has changed, it moves the NRPT policies as appropriate.
+// detectWriteAsGP should only be called when handling a group policy change
+// notification.
 func (db *nrptRuleDatabase) detectWriteAsGP() {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -100,13 +105,34 @@ func (db *nrptRuleDatabase) detectWriteAsGP() {
 		prev := db.writeAsGP
 		db.writeAsGP = writeAsGP
 		db.logf("nrptRuleDatabase using group policy: %v, was %v\n", writeAsGP, prev)
-		// When db.watcher == nil, prev != writeAsGP because we're initializing, not
-		// because anything has changed. We do not invoke
-		// db.updateGroupPoliciesLocked in that case.
-		if db.watcher != nil && prev != writeAsGP {
+		if prev != writeAsGP {
 			db.updateGroupPoliciesLocked(writeAsGP)
 		}
+
+		// Notify the test that writeAsGP can now be checked
+		if nrptTestCallback != nil {
+			nrptTestCallback()
+		}
 	}()
+
+	// Check whether there are any values set for DNSCache group policy.
+	dnsPolicyKey, err := registry.OpenKey(registry.LOCAL_MACHINE, dnsBaseGP, registry.READ)
+	if err != nil && err != registry.ErrNotExist {
+		db.logf("Failed to open key %q with error: %v\n", dnsBaseGP, err)
+	}
+	if err == nil {
+		defer dnsPolicyKey.Close()
+		ki, err := dnsPolicyKey.Stat()
+		if err != nil {
+			db.logf("Failed to stat key %q with error: %v\n", dnsBaseGP, err)
+		}
+
+		if !regKeyHasNoValues(ki) {
+			// We definitely have policy
+			writeAsGP = true
+			return
+		}
+	}
 
 	// Get a list of all the NRPT rules under the GP subkey.
 	nrptKey, err := registry.OpenKey(registry.LOCAL_MACHINE, nrptBaseGP, registry.READ)
@@ -139,6 +165,12 @@ func (db *nrptRuleDatabase) detectWriteAsGP() {
 	// Any leftover rules do not belong to us. When group policy is being used
 	// by something else, we must also use the GP path.
 	writeAsGP = len(gpSubkeyMap) > 0
+}
+
+func regKeyHasNoValues(ki *registry.KeyInfo) bool {
+	// Either the key has no values, or there is one value: an empty default value.
+	return ki.ValueCount == 0 ||
+		ki.ValueCount == 1 && ki.MaxValueNameLen == 0 && ki.MaxValueLen == 0
 }
 
 // DelAllRuleKeys removes any and all NRPT rules that are owned by Tailscale.
@@ -193,8 +225,8 @@ func (db *nrptRuleDatabase) delRuleKeys(nrptRuleIDs []string) error {
 	return registry.DeleteKey(registry.LOCAL_MACHINE, nrptBaseGP)
 }
 
-// isPolicyConfigSubkeyEmpty returns true if and only if the nrptBaseGP exists
-// and does not contain any values or subkeys.
+// isPolicyConfigSubkeyEmpty returns whether the nrptBaseGP exists and does not
+// contain any values or subkeys.
 func isPolicyConfigSubkeyEmpty() (bool, error) {
 	subKey, err := registry.OpenKey(registry.LOCAL_MACHINE, nrptBaseGP, registry.READ)
 	if err != nil {
@@ -210,7 +242,7 @@ func isPolicyConfigSubkeyEmpty() (bool, error) {
 		return false, err
 	}
 
-	return (ki.ValueCount == 0 && ki.SubKeyCount == 0), nil
+	return regKeyHasNoValues(ki) && ki.SubKeyCount == 0, nil
 }
 
 func (db *nrptRuleDatabase) WriteSplitDNSConfig(servers []string, domains []dnsname.FQDN) error {
@@ -285,6 +317,18 @@ func (db *nrptRuleDatabase) Refresh() {
 	db.refreshLocked()
 }
 
+func (db *nrptRuleDatabase) sendInitialGPNotification() {
+	db.refreshInternalLocked()
+}
+
+func (db *nrptRuleDatabase) refreshInternalLocked() error {
+	err := gp.NotifyMachinePolicyChange()
+	if err != nil {
+		db.logf("NotifyMachinePolicyChange failed: %v", err)
+	}
+	return err
+}
+
 func (db *nrptRuleDatabase) refreshLocked() {
 	if !db.isGPDirty {
 		return
@@ -294,13 +338,9 @@ func (db *nrptRuleDatabase) refreshLocked() {
 	// (*nrptRuleDatabase).watchForGPChanges() checks this value to avoid false
 	// positives.
 	db.isGPRefreshPending.Store(true)
-
-	if err := gp.RefreshMachinePolicy(true); err != nil {
-		db.logf("RefreshMachinePolicy failed: %v", err)
-		return
+	if err := db.refreshInternalLocked(); err == nil {
+		db.isGPDirty = false
 	}
-
-	db.isGPDirty = false
 }
 
 func (db *nrptRuleDatabase) writeNRPTRule(ruleID string, servers, doms []string) error {
