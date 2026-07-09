@@ -35,6 +35,7 @@ import (
 	"go4.org/mem"
 	"tailscale.com/client/local"
 	"tailscale.com/cmd/testwrapper/flakytest"
+	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	_ "tailscale.com/feature/clientupdate"
 	"tailscale.com/health"
@@ -57,6 +58,12 @@ func TestMain(m *testing.M) {
 	// Have to disable UPnP which hits the network, otherwise it fails due to HTTP proxy.
 	os.Setenv("TS_DISABLE_UPNP", "true")
 	flag.Parse()
+	if *runWindowsServiceTests {
+		// The Windows service is a singleton (one service, one pipe, one state
+		// dir), so tests against it must run serially. envknob.Setenv refreshes
+		// the already-registered TS_SERIAL_TESTS that tstest.Parallel reads.
+		envknob.Setenv("TS_SERIAL_TESTS", "true")
+	}
 	v := m.Run()
 	if v != 0 {
 		os.Exit(v)

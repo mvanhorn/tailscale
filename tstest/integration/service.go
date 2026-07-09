@@ -28,9 +28,11 @@ import (
 func (n *TestNode) startWindowsServiceDaemon() *Daemon {
 	t := n.env.t
 
-	// install-system-daemon errors if the service exists; clear any leftover.
+	// install-system-daemon errors if the service exists; clear any leftover
+	// service and stale global state from a prior crashed run first.
 	scRun(n.env.daemon, "uninstall-system-daemon")
 	n.waitServiceGone("Tailscale", 30*time.Second)
+	n.cleanupServiceState()
 
 	stageWintun(t, filepath.Dir(n.env.daemon))
 	n.writeServiceEnvFile()
@@ -38,13 +40,31 @@ func (n *TestNode) startWindowsServiceDaemon() *Daemon {
 	if out, err := exec.Command(n.env.daemon, "install-system-daemon").CombinedOutput(); err != nil {
 		t.Fatalf("install-system-daemon: %v\n%s", err, out)
 	}
-	t.Cleanup(func() { scRun(n.env.daemon, "uninstall-system-daemon") })
+	// Teardown (LIFO): stop, uninstall, wait for the service to disappear, then
+	// wipe global state so the next serialized test starts clean. The stop is
+	// defensive in case the test failed before MustCleanShutdown ran.
+	t.Cleanup(func() {
+		exec.Command("sc", "stop", "Tailscale").Run()
+		scRun(n.env.daemon, "uninstall-system-daemon")
+		n.waitServiceGone("Tailscale", 30*time.Second)
+		n.cleanupServiceState()
+	})
 
 	if out, err := exec.Command("sc", "start", "Tailscale").CombinedOutput(); err != nil {
 		t.Fatalf("sc start Tailscale: %v\n%s", err, out)
 	}
 	n.waitServiceReady(90 * time.Second)
 	return &Daemon{svc: n}
+}
+
+// cleanupServiceState removes the global state directory the service writes
+// (%ProgramData%\Tailscale), so a subsequent serialized test doesn't inherit a
+// prior node's identity or state. Called after the service is stopped.
+func (n *TestNode) cleanupServiceState() {
+	dir := filepath.Join(os.Getenv("ProgramData"), "Tailscale")
+	if err := os.RemoveAll(dir); err != nil {
+		n.env.t.Logf("removing %s: %v", dir, err)
+	}
 }
 
 // writeServiceEnvFile writes the harness environment a service can't inherit
@@ -71,7 +91,7 @@ func (n *TestNode) writeServiceEnvFile() {
 	if err := os.WriteFile(dst, []byte(strings.Join(env, "\n")+"\n"), 0o644); err != nil {
 		t.Fatalf("writing %s: %v", dst, err)
 	}
-	t.Cleanup(func() { os.Remove(dst) })
+	// The env file is removed with the rest of the state dir in cleanupServiceState.
 }
 
 // serviceCleanShutdown stops the Tailscale service. There is no owned process to
