@@ -45,6 +45,7 @@ type ConfigVAlpha struct {
 	RunSSHServer    opt.Bool         `json:",omitempty"` // Tailscale SSH
 	RunWebClient    opt.Bool         `json:",omitempty"`
 	ShieldsUp       opt.Bool         `json:",omitempty"`
+	RemoteConfig    opt.Bool         `json:",omitempty"` // delegate full remote control to the tailnet admin; see Prefs.RemoteConfig
 	AutoUpdate      *AutoUpdatePrefs `json:",omitempty"`
 	ServeConfigTemp *ServeConfig     `json:",omitempty"` // TODO(bradfitz,maisem): make separate stable type for this
 
@@ -156,6 +157,10 @@ func (c *ConfigVAlpha) ToPrefs() (MaskedPrefs, error) {
 	if c.ShieldsUp != "" {
 		mp.ShieldsUp = c.ShieldsUp.EqualBool(true)
 		mp.ShieldsUpSet = true
+	}
+	if c.RemoteConfig != "" {
+		mp.RemoteConfig = c.RemoteConfig.EqualBool(true)
+		mp.RemoteConfigSet = true
 	}
 	if c.AutoUpdate != nil {
 		mp.AutoUpdate = *c.AutoUpdate
