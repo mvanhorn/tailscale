@@ -8,6 +8,7 @@ package integration
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -115,7 +116,11 @@ func (n *TestNode) uninstallService() {
 	if !n.serviceExists() {
 		return
 	}
-	if out, err := exec.CommandContext(t.Context(), n.env.daemon, "uninstall-system-daemon").CombinedOutput(); err != nil {
+	// Not t.Context(): this also runs from t.Cleanup, where the test's context
+	// is already canceled.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, n.env.daemon, "uninstall-system-daemon").CombinedOutput(); err != nil {
 		t.Fatalf("uninstall-system-daemon: %v\n%s", err, out)
 	}
 	n.waitServiceGone(30 * time.Second)
