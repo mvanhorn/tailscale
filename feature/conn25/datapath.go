@@ -204,7 +204,7 @@ func (dh *datapathHandler) HandlePacketFromWireGuard(p *packet.Parsed, tun *tstu
 // that the packet should pass through subsequent stages of the datapath pipeline.
 // Returning [filter.Drop] signals the packet should be dropped. This method handles all
 // packets coming from the tun device, on both connectors, and clients of connectors.
-func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed) filter.Response {
+func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed, tun *tstun.Wrapper) filter.Response {
 	if !isSupportedProtocol(p.IPProto) {
 		return filter.Accept
 	}
@@ -233,7 +233,11 @@ func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed) filter.Re
 	transitIP, err := dh.conn25.ClientTransitIPForMagicIP(magicIP)
 	if err != nil {
 		if errors.Is(err, ErrUnmappedMagicIP) {
-			// TODO(tailscale/corp#34257): This path should deliver an ICMP error to the client.
+			// The destination is a Magic IP within a configured range, but
+			// there's no active Transit IP mapping for it (never assigned, or
+			// expired). Tell the local application the host is unreachable so
+			// it recovers quickly (e.g. re-resolves) instead of blackholing.
+			dh.sendICMPHostUnreachable(p, tun)
 			return filter.Drop
 		}
 		dh.debugLogf("error mapping magic IP, passing packet unmodified: %v", err)
@@ -271,6 +275,55 @@ func (dh *datapathHandler) HandlePacketFromTunDevice(p *packet.Parsed) filter.Re
 	})
 	outgoing.Action(p)
 	return filter.Accept
+}
+
+// sendICMPHostUnreachable injects an ICMP "host unreachable" error (or its IPv6
+// equivalent, "address unreachable") back to the local host in response to the
+// tun-device packet p, whose destination Magic IP has no active Transit IP
+// mapping. The error is delivered inbound so the local application that sent p
+// sees it, prompting it to recover (e.g. re-resolve) rather than the packet
+// being silently blackholed.
+func (dh *datapathHandler) sendICMPHostUnreachable(p *packet.Parsed, tun *tstun.Wrapper) {
+	dst := p.Dst.Addr()
+	src := p.Src.Addr()
+
+	// The ICMP error payload carries the offending packet's IP header plus the
+	// first 8 bytes of its transport header, which is enough for the OS to match
+	// the error to the originating socket. The transport section begins right
+	// after the IP header, so its offset is the IP header length.
+	buf := p.Buffer()
+	ipHeaderLen := len(buf) - len(p.Transport())
+	payload := buf[:min(ipHeaderLen+8, len(buf))]
+
+	var errPkt []byte
+	switch {
+	case dst.Is4():
+		errPkt = packet.Generate(packet.ICMP4Header{
+			IP4Header: packet.IP4Header{
+				// The error appears to come from the unreachable Magic IP,
+				// addressed back to the sender.
+				Src: dst,
+				Dst: src,
+			},
+			Type: packet.ICMP4Unreachable,
+			Code: packet.ICMP4HostUnreachable,
+		}, payload)
+	case dst.Is6():
+		errPkt = packet.Generate(packet.ICMP6Header{
+			IP6Header: packet.IP6Header{
+				Src: dst,
+				Dst: src,
+			},
+			Type: packet.ICMP6Unreachable,
+			Code: packet.ICMP6AddressUnreachable,
+		}, payload)
+	default:
+		return
+	}
+
+	if err := tun.InjectInboundCopy(errPkt); err != nil {
+		dh.debugLogf("error injecting ICMP host unreachable packet: %v", err)
+	}
 }
 
 func (dh *datapathHandler) dnatAction(to netip.Addr) PacketAction {
