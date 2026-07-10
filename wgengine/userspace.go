@@ -124,6 +124,7 @@ type userspaceEngine struct {
 
 	lastCfgFull        wgcfg.Config
 	lastRouter         *router.Config
+	routerConfigured   bool           // whether the last successfully applied router config was non-empty
 	lastDNSConfig      dns.ConfigView // or invalid if none
 	lastIsSubnetRouter bool           // was the node a primary subnet router in the last run.
 	reconfigureVPN     func() error   // or nil
@@ -1000,6 +1001,13 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		if err != nil {
 			return err
 		}
+		routerConfigured := !routerCfg.Equal(&router.Config{})
+		if !e.routerConfigured && routerConfigured {
+			// The TUN interface can gain its addresses after netmon's initial
+			// state snapshot, so rescan it immediately on first bring-up.
+			e.netMon.InjectEvent()
+		}
+		e.routerConfigured = routerConfigured
 	}
 
 	// We've historically re-set DNS even after just a router change. While

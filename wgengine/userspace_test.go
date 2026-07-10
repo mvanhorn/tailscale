@@ -125,6 +125,137 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 	}
 }
 
+func TestUserspaceEngineReconfigInjectsNetmonEvent(t *testing.T) {
+	bus := eventbustest.NewBus(t)
+	mon, err := netmon.New(bus, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rtr := new(reconfigTestRouter)
+	e, err := NewUserspaceEngine(t.Logf, Config{
+		Router:        rtr,
+		NetMon:        mon,
+		HealthTracker: health.NewTracker(bus),
+		Metrics:       new(usermetric.Registry),
+		EventBus:      bus,
+		RespondToPing: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes := make(chan *netmon.ChangeDelta, 4)
+	unregister := mon.RegisterChangeCallback(func(delta *netmon.ChangeDelta) {
+		changes <- delta
+	})
+	t.Cleanup(func() {
+		unregister()
+		e.Close()
+		mon.Close()
+	})
+
+	routerCfg := &router.Config{
+		LocalAddrs: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+	}
+	if err := e.Reconfig(&wgcfg.Config{}, routerCfg, &dns.Config{}); err != nil {
+		t.Fatalf("first Reconfig: %v", err)
+	}
+	select {
+	case <-changes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for link-monitor rescan after first router config")
+	}
+
+	// Let netmon finish its debounce period, while also verifying that the
+	// first Reconfig injected exactly one event.
+	select {
+	case delta := <-changes:
+		t.Fatalf("unexpected additional link-monitor event after first Reconfig: %v", delta)
+	case <-time.After(1100 * time.Millisecond):
+	}
+
+	if err := e.Reconfig(&wgcfg.Config{}, routerCfg, &dns.Config{}); err != ErrNoChanges {
+		t.Fatalf("unchanged Reconfig error = %v, want ErrNoChanges", err)
+	}
+	assertNoNetmonChange(t, changes)
+
+	if err := e.Reconfig(&wgcfg.Config{}, &router.Config{}, &dns.Config{}); err != nil {
+		t.Fatalf("shutdown Reconfig: %v", err)
+	}
+	assertNoNetmonChange(t, changes)
+}
+
+func TestUserspaceEngineReconfigRouterErrorDoesNotInjectNetmonEvent(t *testing.T) {
+	bus := eventbustest.NewBus(t)
+	mon, err := netmon.New(bus, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routerErr := fmt.Errorf("router set failed")
+	rtr := &reconfigTestRouter{setErr: routerErr}
+	e, err := NewUserspaceEngine(t.Logf, Config{
+		Router:        rtr,
+		NetMon:        mon,
+		HealthTracker: health.NewTracker(bus),
+		Metrics:       new(usermetric.Registry),
+		EventBus:      bus,
+		RespondToPing: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes := make(chan *netmon.ChangeDelta, 1)
+	unregister := mon.RegisterChangeCallback(func(delta *netmon.ChangeDelta) {
+		changes <- delta
+	})
+	t.Cleanup(func() {
+		unregister()
+		e.Close()
+		mon.Close()
+	})
+
+	routerCfg := &router.Config{
+		LocalAddrs: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+	}
+	if err := e.Reconfig(&wgcfg.Config{}, routerCfg, &dns.Config{}); err != routerErr {
+		t.Fatalf("Reconfig error = %v, want %v", err, routerErr)
+	}
+	assertNoNetmonChange(t, changes)
+
+	rtr.setErr = nil
+	routerCfg.LocalAddrs = []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")}
+	if err := e.Reconfig(&wgcfg.Config{}, routerCfg, &dns.Config{}); err != nil {
+		t.Fatalf("successful Reconfig after router error: %v", err)
+	}
+	select {
+	case <-changes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for link-monitor rescan after router recovered")
+	}
+}
+
+func assertNoNetmonChange(t *testing.T, changes <-chan *netmon.ChangeDelta) {
+	t.Helper()
+	select {
+	case delta := <-changes:
+		t.Fatalf("unexpected link-monitor event: %v", delta)
+	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+type reconfigTestRouter struct {
+	setErr error
+}
+
+func (*reconfigTestRouter) Up() error    { return nil }
+func (*reconfigTestRouter) Close() error { return nil }
+
+func (r *reconfigTestRouter) Set(cfg *router.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	return r.setErr
+}
+
 func TestUserspaceEngineTSMPLearned(t *testing.T) {
 	bus := eventbustest.NewBus(t)
 
