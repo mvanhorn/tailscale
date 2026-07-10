@@ -141,9 +141,8 @@ var args struct {
 }
 
 var (
-	installSystemDaemon   func([]string) error                      // non-nil on some platforms
-	uninstallSystemDaemon func([]string) error                      // non-nil on some platforms
-	createBIRDClient      func(string) (wgengine.BIRDClient, error) // non-nil on some platforms
+	installSystemDaemon   func([]string) error // non-nil on some platforms
+	uninstallSystemDaemon func([]string) error // non-nil on some platforms
 )
 
 // Note - we use function pointers for subcommands so that subcommands like
@@ -280,7 +279,7 @@ store state on filesystem.`)
 		log.Fatalf("--socket is required")
 	}
 
-	if buildfeatures.HasBird && args.birdSocketPath != "" && createBIRDClient == nil {
+	if buildfeatures.HasBird && args.birdSocketPath != "" && !wgengine.HookNewBird.IsSet() {
 		log.SetFlags(0)
 		log.Fatalf("--bird-socket is not supported on %s", runtime.GOOS)
 	}
@@ -784,12 +783,8 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 	netstackSubnetRouter := onlyNetstack // but mutated later on some platforms
 	netns.SetEnabled(!onlyNetstack)
 
-	if args.birdSocketPath != "" && createBIRDClient != nil {
-		log.Printf("Connecting to BIRD at %s ...", args.birdSocketPath)
-		conf.BIRDClient, err = createBIRDClient(args.birdSocketPath)
-		if err != nil {
-			return false, fmt.Errorf("createBIRDClient: %w", err)
-		}
+	if buildfeatures.HasBird && args.birdSocketPath != "" {
+		conf.BIRDSocket = args.birdSocketPath
 	}
 	if onlyNetstack {
 		if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
