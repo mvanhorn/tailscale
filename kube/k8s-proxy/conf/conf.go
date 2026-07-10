@@ -73,6 +73,7 @@ type APIServerProxyConfig struct {
 	Mode        *kubetypes.APIServerProxyMode `json:",omitempty"` // "auth" or "noauth" mode.
 	ServiceName *tailcfg.ServiceName          `json:",omitempty"` // Name of the Tailscale Service to advertise.
 	IssueCerts  opt.Bool                      `json:",omitempty"` // Whether this replica should issue TLS certs for the Tailscale Service.
+	HTTPS       opt.Bool                      `json:",omitempty"` // Whether to serve https on port 443, or, if false, http on port 80. Defaults to true.
 }
 
 // Load reads and parses the config file at the provided path on disk.

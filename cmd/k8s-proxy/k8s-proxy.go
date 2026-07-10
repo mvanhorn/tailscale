@@ -160,10 +160,12 @@ func run(logger *zap.SugaredLogger) error {
 
 	// TODO(tomhjp): Pass this setting directly into the store instead of using
 	// environment variables.
-	if cfg.Parsed.APIServerProxy != nil && cfg.Parsed.APIServerProxy.IssueCerts.EqualBool(true) {
-		os.Setenv("TS_CERT_SHARE_MODE", "rw")
-	} else {
-		os.Setenv("TS_CERT_SHARE_MODE", "ro")
+	if cfg.Parsed.APIServerProxy != nil && !cfg.Parsed.APIServerProxy.HTTPS.EqualBool(false) {
+		if cfg.Parsed.APIServerProxy.IssueCerts.EqualBool(true) {
+			os.Setenv("TS_CERT_SHARE_MODE", "rw")
+		} else {
+			os.Setenv("TS_CERT_SHARE_MODE", "ro")
+		}
 	}
 
 	st, err := getStateStore(cfg.Parsed.State, logger)
@@ -354,7 +356,7 @@ func run(logger *zap.SugaredLogger) error {
 		logger.Infof("Will issue TLS certs for Tailscale Service")
 		cm = certs.NewCertManager(klc.New(lc), logger.Infof)
 	}
-	if err := setServeConfig(ctx, lc, cm, apiServerProxyService(cfg)); err != nil {
+	if err := setServeConfig(ctx, lc, cm, cfg); err != nil {
 		return err
 	}
 
@@ -426,7 +428,7 @@ func run(logger *zap.SugaredLogger) error {
 					return fmt.Errorf("error editing prefs: %w", err)
 				}
 			}
-			if err := setServeConfig(ctx, lc, cm, apiServerProxyService(cfg)); err != nil {
+			if err := setServeConfig(ctx, lc, cm, cfg); err != nil {
 				return fmt.Errorf("error setting serve config: %w", err)
 			}
 
@@ -477,17 +479,6 @@ func getRestConfig(logger *zap.SugaredLogger) (*rest.Config, error) {
 	return restConfig, nil
 }
 
-func apiServerProxyService(cfg *conf.Config) tailcfg.ServiceName {
-	if cfg.Parsed.APIServerProxy != nil &&
-		cfg.Parsed.APIServerProxy.Enabled.EqualBool(true) &&
-		cfg.Parsed.APIServerProxy.ServiceName != nil &&
-		*cfg.Parsed.APIServerProxy.ServiceName != "" {
-		return tailcfg.ServiceName(*cfg.Parsed.APIServerProxy.ServiceName)
-	}
-
-	return ""
-}
-
 func shouldIssueCerts(cfg *conf.Config) bool {
 	return cfg.Parsed.APIServerProxy != nil &&
 		cfg.Parsed.APIServerProxy.IssueCerts.EqualBool(true)
@@ -495,14 +486,17 @@ func shouldIssueCerts(cfg *conf.Config) bool {
 
 // setServeConfig sets up serve config such that it's serving for the passed in
 // Tailscale Service, and does nothing if it's already up to date.
-func setServeConfig(ctx context.Context, lc *local.Client, cm *certs.CertManager, name tailcfg.ServiceName) error {
+func setServeConfig(ctx context.Context, lc *local.Client, cm *certs.CertManager, cfg *conf.Config) error {
 	existingServeConfig, err := lc.GetServeConfig(ctx)
 	if err != nil {
 		return fmt.Errorf("error getting existing serve config: %w", err)
 	}
 
-	// Ensure serve config is cleared if no Tailscale Service.
-	if name == "" {
+	// Ensure serve config is cleared if no Tailscale Service to advertise.
+	if cfg.Parsed.APIServerProxy == nil ||
+		!cfg.Parsed.APIServerProxy.Enabled.EqualBool(true) ||
+		cfg.Parsed.APIServerProxy.ServiceName == nil ||
+		*cfg.Parsed.APIServerProxy.ServiceName == "" {
 		if reflect.DeepEqual(*existingServeConfig, ipn.ServeConfig{}) {
 			// Already up to date.
 			return nil
@@ -518,13 +512,18 @@ func setServeConfig(ctx context.Context, lc *local.Client, cm *certs.CertManager
 	if err != nil {
 		return fmt.Errorf("error getting local client status: %w", err)
 	}
+	name := tailcfg.ServiceName(*cfg.Parsed.APIServerProxy.ServiceName)
 	serviceSNI := fmt.Sprintf("%s.%s", name.WithoutPrefix(), status.CurrentTailnet.MagicDNSSuffix)
 
+	var port uint16 = 443
+	if cfg.Parsed.APIServerProxy.HTTPS.EqualBool(false) {
+		port = 80
+	}
 	serveConfig := ipn.ServeConfig{
 		Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
 			name: {
 				TCP: map[uint16]*ipn.TCPPortHandler{
-					443: {
+					port: {
 						TCPForward:    "localhost:80",
 						TerminateTLS:  serviceSNI,
 						ProxyProtocol: proxyProtocolV2,
